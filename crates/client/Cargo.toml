@@ -1,0 +1,21 @@
+[package]
+name = "bridge-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-protocol.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+deadpool-redis.workspace = true
+snafu.workspace = true
+# select! → macros,spawn → rt,oneshot → sync,timeout/sleep → time
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+snafu.workspace = true
+# examples 需要 #[tokio::main] 的多线程运行时
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

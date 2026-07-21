@@ -1,0 +1,23 @@
+[package]
+name = "bridge-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bridge-protocol.workspace = true
+bytes.workspace = true
+deadpool-redis.workspace = true
+reqwest.workspace = true
+snafu.workspace = true
+# main → macros/rt-multi-thread,ctrl_c → signal,Semaphore → sync,interval/sleep → time
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
