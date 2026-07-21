@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/protocol", "crates/client", "crates/agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+bridge-protocol = { path = "crates/protocol" }
+
+# deadpool-redis re-exports the matching `redis` crate; both sides use the
+# re-export so pool and raw client can never disagree on the redis version.
+deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
+# tokio 本身无 default feature,各 crate 按实际用到的 API 自行开启
+tokio = { version = "1" }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+serde_json = "1"
+# 与 Go encoding/json 对 []byte 的处理对齐:标准字母表 + 填充
+base64 = "0.22"
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+snafu = "0.8"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
