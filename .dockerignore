@@ -1,0 +1,18 @@
+# 构建只需要 Cargo 清单和 crates/,其余一概排除以缩小构建上下文。
+# 注意 .dockerignore 也会影响缓存:上下文里任何文件变动都可能让 COPY 层失效。
+
+.git
+.gitignore
+.github
+
+# 本地构建产物绝不能进上下文,否则既拖慢构建又可能污染容器内的 target
+target
+**/target
+
+# 文档与运维脚本不参与编译
+*.md
+scripts
+
+Dockerfile
+.dockerignore
+LICENSE

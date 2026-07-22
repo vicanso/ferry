@@ -38,6 +38,24 @@ MAX_CONCURRENCY=64 \
 cargo run -p bridge-agent
 ```
 
+或用容器跑(多阶段构建,只产出 agent;client 是库,由调用方自己集成):
+
+```bash
+docker build -t ferry-agent .
+
+# agent 要访问宿主机上的本地 HTTP 服务,所以用 host 网络最省事
+docker run --rm --network host \
+  -e REDIS_URL=redis://127.0.0.1:6379 \
+  -e BRIDGE_SERVICE=demo \
+  -e UPSTREAM_URL=http://127.0.0.1:8080 \
+  -e MAX_CONCURRENCY=64 \
+  ferry-agent
+```
+
+停止时用 `docker stop`(发 SIGTERM),agent 会停止拉取新请求并等 in-flight
+排空后再退出。**grace period 要留够** —— `docker stop` 默认只给 10 秒,
+k8s 用 `terminationGracePeriodSeconds`;时间不够会在排空途中被 SIGKILL。
+
 A 侧:
 
 ```rust

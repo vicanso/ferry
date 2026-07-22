@@ -133,7 +133,7 @@ async fn run() -> Result<(), AgentError> {
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             tracing::info!("shutdown signal received; stop pulling, draining in-flight");
             shutdown.cancel();
         });
@@ -148,6 +148,34 @@ async fn run() -> Result<(), AgentError> {
         "bridge agent started"
     );
     pull_loop(agent, cfg.redis_url, shutdown).await
+}
+
+/// 等待终止信号。
+///
+/// 必须同时监听 SIGTERM:容器编排器(`docker stop`、k8s)发的是 SIGTERM,
+/// 只监听 SIGINT 的话进程收不到任何信号,会在 grace period 结束后被 SIGKILL
+/// 强杀,in-flight 请求全部丢失 —— 优雅关闭形同虚设。
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot install SIGTERM handler; only SIGINT will work");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!(signal = "SIGINT", "signal received"),
+        _ = sigterm.recv() => tracing::info!(signal = "SIGTERM", "signal received"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// 主循环:先拿许可 → BRPOP 一条 → spawn 处理。断线指数退避自愈。
