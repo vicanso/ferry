@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/client", "crates/agent"]
+members = ["crates/protocol", "crates/redis", "crates/client", "crates/agent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,14 +8,34 @@ edition = "2021"
 
 [workspace.dependencies]
 bridge-protocol = { path = "crates/protocol" }
+bridge-redis = { path = "crates/redis" }
 
-# deadpool-redis re-exports the matching `redis` crate; both sides use the
-# re-export so pool and raw client can never disagree on the redis version.
-deadpool-redis = { version = "0.18", features = ["rt_tokio_1"] }
+# tibba 已发布,直接用版本依赖(0.2.6 含专用阻塞连接、cluster 密码修复等)。
+# 不再依赖本地目录,`docker build .` 也不受构建上下文限制了。
+tibba-cache = "0.2.6"
+tibba-config = "0.2.6"
+tibba-error = "0.2.6"
+
+# ferry 不声明任何 Redis 生态依赖:连接池归 tibba-cache,构造命令用的 `redis` crate
+# 也由它转出(bridge-redis 再转一手给 client/agent)。版本对齐完全由 tibba 保证,
+# 连理论上分叉的可能都没有 —— 分叉会导致 ConnectionLike 不是同一个 trait。
+# TLS 同理:要走 rediss:// 就在 tibba 侧开 rustls feature。
 # tokio 本身无 default feature,各 crate 按实际用到的 API 自行开启
 tokio = { version = "1" }
 tokio-util = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+# 刻意不开 TLS:upstream 是本机明文 HTTP。若要支持 https,加 "rustls-tls"
+# (自带根证书)或 "rustls-tls-native-roots"(用系统信任库,镜像需装 ca-certificates)。
+# 注:rustls / ring 已作为可选依赖记在 Cargo.lock 里但未参与编译,所以将来启用
+# TLS 不会牵动其他依赖的版本。openssl / native-tls 则连锁文件里都没有。
+#
+# gzip / brotli:让 reqwest 透明解压上游响应(agent 会剥掉调用方的 accept-encoding、
+# 由 reqwest 自行协商)。两者均为纯 Rust(flate2+miniz_oxide / brotli),不引 C 依赖,
+# runtime 镜像无需额外系统库。要 deflate / zstd 再加同名特性即可(zstd 会带 C 绑定)。
+reqwest = { version = "0.13", default-features = false, features = [
+    "http2",
+    "gzip",
+    "brotli",
+] }
 serde_json = "1"
 # 与 Go encoding/json 对 []byte 的处理对齐:标准字母表 + 填充
 base64 = "0.22"
@@ -23,7 +43,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 serde = { version = "1", features = ["derive"] }
-snafu = "0.8"
+snafu = "0.9"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

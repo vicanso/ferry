@@ -1,0 +1,33 @@
+# agent 的默认配置,通过 include_str! 烘焙进二进制。
+#
+# 三层叠加,后者覆盖前者:
+#   1. 本文件
+#   2. FERRY_CONFIG 指向的外部 TOML(可选)
+#   3. 环境变量,前缀 FERRY,层级分隔符是双下划线
+#      例如 FERRY__REDIS__URI、FERRY__AGENT__MAX_CONCURRENCY
+#
+# 容器里通常什么都不挂,直接用环境变量覆盖即可。
+
+[redis]
+# 支持 tibba 的聚合写法:一个 scheme + 逗号分隔的多个 host + 查询参数。
+# 密码只写一次,不必在每个节点上重复;rediss:// 会被保留为 TLS。
+# 连接池参数(pool_size、connection_timeout 等)写在查询串里,例如
+#   redis://:pw@h1:6379,h2:6379/?pool_size=20&connection_timeout=3s
+uri = "redis://127.0.0.1:6379"
+
+[agent]
+# 消费哪个服务的请求队列,对应 {key_prefix}:req:{service}
+service = "demo"
+
+# Redis key 前缀,请求 / 响应队列都用它:{key_prefix}:req:{service}、
+# {key_prefix}:resp:{...}。**调用方(A 侧)必须用同一个前缀**,否则两端看不到对方。
+# 留空 / 删除本行则回退默认 bridge。
+key_prefix = "bridge"
+
+# 允许被访问的上游清单。**留空则拒绝启动** —— 空清单等于开放代理。
+# 可写成数组,也可写成逗号分隔的字符串(环境变量只能用后者)。
+# 匹配按 origin(scheme+host+port)严格比对;带路径则额外限制在该子树内。
+allowed_upstreams = []
+
+# 同时在途的请求数上限,也是 semaphore 的许可总数
+max_concurrency = 64

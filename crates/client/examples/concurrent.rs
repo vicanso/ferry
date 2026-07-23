@@ -28,7 +28,9 @@ async fn run() -> Result<(), Whatever> {
         .unwrap_or_else(|| "100".into())
         .parse()
         .whatever_context("first argument must be a request count")?;
-    let uri = args.next().unwrap_or_else(|| "/".into());
+    let target = args
+        .next()
+        .unwrap_or_else(|| "http://127.0.0.1:8080/".into());
 
     let client = Arc::new(
         BridgeClient::start(Config::new(redis_url, service))
@@ -40,12 +42,12 @@ async fn run() -> Result<(), Whatever> {
     let mut tasks = Vec::with_capacity(n);
     for i in 0..n {
         let client = Arc::clone(&client);
-        let uri = uri.clone();
+        let url = target.clone();
         tasks.push(tokio::spawn(async move {
             let resp = client
                 .call(CallRequest {
                     method: "GET".into(),
-                    uri,
+                    url,
                     headers: vec![("x-seq".into(), i.to_string())],
                     body: Bytes::new(),
                     timeout: Duration::from_secs(30),

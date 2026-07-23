@@ -8,89 +8,204 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use deadpool_redis::redis;
-use deadpool_redis::{Pool, Runtime};
+use bridge_redis::RedisClient;
+use bridge_redis::redis;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
 use snafu::{prelude::*, Report};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use bridge_protocol::{
-    decode, encode, is_hop_by_hop, reply_queue, request_queue, BridgeError, HttpOk, HttpRequest,
-    HttpResponse, MAX_BODY_SIZE, RESP_TTL_SECS,
+    decode, encode, is_hop_by_hop, BridgeError, HttpOk, HttpRequest, HttpResponse, Keyspace,
+    ReplyMode, MAX_BODY_SIZE, RESP_KV_TTL_SECS, RESP_TTL_SECS,
 };
 
-/// BRPOP 的阻塞时长。由于 BRPOP 发出后不可取消,这个值同时是
+/// BRPOP 的最长阻塞时长。由于 BRPOP 发出后不可取消,这个值同时是
 /// 「关闭 / 断线被感知」的延迟上限。
-const BRPOP_TIMEOUT_SECS: u64 = 2;
+/// 它同时决定专用连接的 response timeout —— 由 tibba 依此推导,见
+/// `dedicated_blocking_conn`。
+const MAX_BLOCK: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const METRICS_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_CONCURRENCY: usize = 64;
 
 #[derive(Debug, Snafu)]
 enum AgentError {
-    #[snafu(display("UPSTREAM_URL {url:?} is not a valid URL"))]
-    UpstreamUrl { source: url::ParseError, url: String },
-    #[snafu(display("MAX_CONCURRENCY {value:?} is not an integer"))]
-    MaxConcurrency {
-        source: std::num::ParseIntError,
-        value: String,
+    #[snafu(display("agent.allowed_upstreams entry {url:?} is not a valid URL"))]
+    AllowedUpstream { source: url::ParseError, url: String },
+    #[snafu(display(
+        "agent.allowed_upstreams is empty; refusing to start (an agent with no allow list \
+         would be an open proxy into this network)"
+    ))]
+    EmptyAllowList,
+    #[snafu(display("agent.allowed_upstreams entry {url:?} must use http or https"))]
+    NonHttpUpstream { url: String },
+    #[snafu(display("failed to read the config file {path:?}"))]
+    ReadConfig {
+        source: std::io::Error,
+        path: String,
     },
-    #[snafu(display("MAX_CONCURRENCY must be greater than 0"))]
+    #[snafu(display("failed to load the configuration"))]
+    Config { source: tibba_config::Error },
+    #[snafu(display("failed to build the http client: {detail}"))]
+    HttpClient { detail: String },
+    #[snafu(display("agent.max_concurrency must be greater than 0"))]
     ZeroConcurrency,
-    #[snafu(display("failed to create the redis pool"))]
-    CreatePool {
-        source: deadpool_redis::CreatePoolError,
-    },
-    #[snafu(display("failed to open a dedicated redis connection"))]
-    RedisConnect { source: redis::RedisError },
-    #[snafu(display("redis pool is unavailable"))]
-    Pool { source: deadpool_redis::PoolError },
+    #[snafu(display("redis connection failed"))]
+    Redis { source: bridge_redis::Error },
+    /// 从 tibba-cache 借用连接失败(池耗尽、连接建立失败等)
+    #[snafu(display("failed to acquire a redis connection"))]
+    Acquire { source: bridge_redis::CacheError },
     #[snafu(display("redis command failed"))]
-    Redis { source: redis::RedisError },
+    Command { source: redis::RedisError },
     #[snafu(display("failed to encode the response"))]
     Encode { source: bridge_protocol::CodecError },
 }
 
 struct Agent {
-    redis: Pool,
+    redis: Arc<RedisClient>,
     http: reqwest::Client,
-    upstream: Url,
+    /// 允许被访问的上游清单。目标 URL 由请求方给出,但必须落在这里面。
+    allowed: Vec<Url>,
     sem: Arc<Semaphore>,
     service: String,
+    /// Redis key 命名空间(前缀可配)。请求队列 / 回复都经它拼 key。
+    keyspace: Keyspace,
     max_concurrency: usize,
+}
+
+/// 烘焙进二进制的默认配置,保证不挂任何文件也能启动。
+const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
+
+/// 指向外部 TOML 的环境变量;不设则只用默认配置 + 环境变量覆盖。
+const CONFIG_PATH_ENV: &str = "FERRY_CONFIG";
+const ENV_PREFIX: &str = "FERRY";
+
+/// 既接受 TOML 数组,也接受逗号分隔的字符串。
+///
+/// 环境变量只能表达后者 —— tibba-config 没给 config-rs 设 `list_separator`,
+/// 所以 `FERRY__AGENT__ALLOWED_UPSTREAMS=a,b` 反序列化成 `Vec<String>` 会失败。
+/// 用 untagged 同时容纳两种写法,配置文件里可以写得好看,环境变量也能覆盖。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringList {
+    Csv(String),
+    List(Vec<String>),
+}
+
+impl StringList {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StringList::Csv(s) => s
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            StringList::List(v) => v.into_iter().filter(|s| !s.trim().is_empty()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRedis {
+    uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAgent {
+    service: String,
+    allowed_upstreams: StringList,
+    max_concurrency: usize,
+    /// Redis key 前缀。缺省 / 留空回退到 `bridge`(见 Keyspace)。
+    #[serde(default)]
+    key_prefix: String,
 }
 
 struct AgentConfig {
     redis_url: String,
     service: String,
-    upstream: Url,
+    allowed: Vec<Url>,
     max_concurrency: usize,
+    key_prefix: String,
 }
 
-fn config_from_env() -> Result<AgentConfig, AgentError> {
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-    let service = std::env::var("BRIDGE_SERVICE").unwrap_or_else(|_| "demo".into());
-    let raw_upstream =
-        std::env::var("UPSTREAM_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let upstream = raw_upstream.parse::<Url>().context(UpstreamUrlSnafu {
-        url: raw_upstream.clone(),
-    })?;
-    let max_concurrency = match std::env::var("MAX_CONCURRENCY") {
-        Ok(raw) => raw
-            .parse::<usize>()
-            .context(MaxConcurrencySnafu { value: raw.clone() })?,
-        Err(_) => DEFAULT_MAX_CONCURRENCY,
-    };
-    ensure!(max_concurrency > 0, ZeroConcurrencySnafu);
+/// 按「烘焙默认值 → 外部文件 → 环境变量」三层叠加加载配置。
+fn load_config() -> Result<AgentConfig, AgentError> {
+    let mut builder = tibba_config::Config::builder().add_toml(DEFAULT_CONFIG);
+    if let Ok(path) = std::env::var(CONFIG_PATH_ENV) {
+        let data = std::fs::read_to_string(&path).context(ReadConfigSnafu { path })?;
+        builder = builder.add_toml(data);
+    }
+    let config = builder
+        .with_env_prefix(ENV_PREFIX)
+        .build()
+        .context(ConfigSnafu)?;
+
+    // 按段取,不在根配置上整体反序列化:tibba-config 的 `try_deserialize` 在
+    // prefix 为空时会拿空字符串当 key 去查,config-rs 解析空 key 直接报
+    // "invalid identifier"。分段读时 prefix 非空,绕开该问题。
+    let redis: RawRedis = config
+        .sub_config("redis")
+        .try_deserialize()
+        .context(ConfigSnafu)?;
+    let agent: RawAgent = config
+        .sub_config("agent")
+        .try_deserialize()
+        .context(ConfigSnafu)?;
+
+    // 允许清单必须逐条校验:只接受 http(s),且不能为空 —— 空清单等于开放代理
+    let mut allowed = Vec::new();
+    for entry in agent.allowed_upstreams.into_vec() {
+        let url = entry
+            .parse::<Url>()
+            .context(AllowedUpstreamSnafu { url: entry.clone() })?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            NonHttpUpstreamSnafu { url: entry }
+        );
+        allowed.push(url);
+    }
+    ensure!(!allowed.is_empty(), EmptyAllowListSnafu);
+    ensure!(agent.max_concurrency > 0, ZeroConcurrencySnafu);
+
     Ok(AgentConfig {
-        redis_url,
-        service,
-        upstream,
-        max_concurrency,
+        redis_url: redis.uri,
+        service: agent.service,
+        allowed,
+        max_concurrency: agent.max_concurrency,
+        key_prefix: agent.key_prefix,
+    })
+}
+
+/// 目标 URL 是否落在允许清单内。
+///
+/// 匹配规则:
+/// 1. **origin(scheme + host + port)必须完全相同** —— 这是硬边界。任何
+///    主机名、端口或协议的差异都会被拒绝,`file:`/`data:` 这类不透明 origin
+///    也因此天然不匹配。
+/// 2. 清单项若带路径,则目标路径必须落在它的子树内,且按**路径段边界**比较,
+///    以免 `/api` 意外放行 `/apifoo`。清单项路径为空或 `/` 时不做路径限制。
+///
+/// `Url::parse` 会规范化 `.` 与 `..`,所以普通的路径穿越进不来;但百分号编码的
+/// `%2e` / `%2f` 不会被解码,上游服务器却可能解码它们,因此在有路径限制时直接
+/// 拒绝含这两者的路径。origin 才是可靠的边界,路径限制属于纵深防御。
+fn is_allowed(target: &Url, allowed: &[Url]) -> bool {
+    allowed.iter().any(|entry| {
+        if entry.origin() != target.origin() {
+            return false;
+        }
+        let base = entry.path().trim_end_matches('/');
+        if base.is_empty() {
+            return true;
+        }
+        let path = target.path();
+        if path.to_ascii_lowercase().contains("%2e") || path.to_ascii_lowercase().contains("%2f") {
+            return false;
+        }
+        path == base || path.starts_with(&format!("{base}/"))
     })
 }
 
@@ -107,25 +222,28 @@ async fn run() -> Result<(), AgentError> {
         )
         .init();
 
-    let cfg = config_from_env()?;
-    let pool = deadpool_redis::Config::from_url(&cfg.redis_url)
-        .create_pool(Some(Runtime::Tokio1))
-        .context(CreatePoolSnafu)?;
-    {
-        // fail fast:启动时先验证 Redis 可达
-        let mut conn = pool.get().await.context(PoolSnafu)?;
-        redis::cmd("PING")
-            .query_async::<()>(&mut conn)
-            .await
-            .context(RedisSnafu)?;
-    }
+    let cfg = load_config()?;
+    // 单节点还是集群由 bridge-redis 判定(节点数 + CLUSTER INFO 探测),
+    // 这里不关心拓扑。connect 内部已做过 PING 的可达性验证。
+    let redis = Arc::new(bridge_redis::connect(&cfg.redis_url).context(RedisSnafu)?);
+
+    // 必须禁用自动跟随重定向:否则上游只要回一个 302 指向内网地址,agent 就会
+    // 跟过去,允许清单形同虚设。3xx 原样回给调用方,由它自己决定要不要跟。
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| AgentError::HttpClient { detail: e.to_string() })?;
+
+    let keyspace = Keyspace::new(&cfg.key_prefix);
+    tracing::info!(key_prefix = keyspace.prefix(), "redis keyspace");
 
     let agent = Arc::new(Agent {
-        redis: pool,
-        http: reqwest::Client::new(),
-        upstream: cfg.upstream,
+        redis,
+        http,
+        allowed: cfg.allowed,
         sem: Arc::new(Semaphore::new(cfg.max_concurrency)),
         service: cfg.service,
+        keyspace,
         max_concurrency: cfg.max_concurrency,
     });
 
@@ -143,11 +261,12 @@ async fn run() -> Result<(), AgentError> {
 
     tracing::info!(
         service = %agent.service,
-        upstream = %agent.upstream,
+        redis_cluster = agent.redis.is_cluster(),
+        allowed_upstreams = %agent.allowed.iter().map(Url::as_str).collect::<Vec<_>>().join(", "),
         max_concurrency = agent.max_concurrency,
         "bridge agent started"
     );
-    pull_loop(agent, cfg.redis_url, shutdown).await
+    pull_loop(agent, shutdown).await
 }
 
 /// 等待终止信号。
@@ -179,18 +298,15 @@ async fn shutdown_signal() {
 }
 
 /// 主循环:先拿许可 → BRPOP 一条 → spawn 处理。断线指数退避自愈。
-async fn pull_loop(
-    agent: Arc<Agent>,
-    redis_url: String,
-    shutdown: CancellationToken,
-) -> Result<(), AgentError> {
-    let queue = request_queue(&agent.service);
+async fn pull_loop(agent: Arc<Agent>, shutdown: CancellationToken) -> Result<(), AgentError> {
+    let queue = agent.keyspace.request_queue(&agent.service);
     // BRPOP 是阻塞命令,用专用连接,不从连接池借
-    let client = redis::Client::open(redis_url.as_str()).context(RedisConnectSnafu)?;
-    let mut conn: Option<redis::aio::MultiplexedConnection> = None;
+    let mut conn: Option<bridge_redis::RedisDedicatedConn> = None;
     let mut backoff = INITIAL_BACKOFF;
     let mut brpop = redis::cmd("BRPOP");
-    brpop.arg(&queue).arg(BRPOP_TIMEOUT_SECS);
+    // 服务端超时由 tibba 的 helper 从 MAX_BLOCK 推导,和连接的 response timeout
+    // 出自同一个来源,不会再出现两者对不上导致每次都超时的情况
+    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(MAX_BLOCK));
 
     'main: loop {
         // ① 先拿许可再拉取,顺序不能反:让请求积压在 Redis 队列里而不是本进程内存里
@@ -206,11 +322,11 @@ async fn pull_loop(
                 break 'pull None;
             }
             if conn.is_none() {
-                match client.get_multiplexed_async_connection().await {
-                    Ok(c) => {
-                        backoff = INITIAL_BACKOFF;
-                        conn = Some(c);
-                    }
+                match agent.redis.dedicated_blocking_conn(MAX_BLOCK).await {
+                    // 这里**不能**重置 backoff。像 MOVED 这种「连得上但每条命令都
+                    // 失败」的故障,重连总是成功的,在这里重置会让退避永远归零、
+                    // 退化成热循环。只有命令真正成功才算恢复。
+                    Ok(c) => conn = Some(c),
                     Err(e) => {
                         tracing::warn!(error = %e, ?backoff, "pull_loop: redis connect failed, retrying");
                         tokio::select! {
@@ -229,12 +345,23 @@ async fn pull_loop(
             // BRPOP_TIMEOUT_SECS 秒。
             let res: redis::RedisResult<Option<(String, Vec<u8>)>> = brpop.query_async(c).await;
             match res {
-                Ok(Some((_key, raw))) => break 'pull Some(raw),
-                // BRPOP 到时无消息,回头检查 shutdown 再继续
-                Ok(None) => {}
+                Ok(Some((_key, raw))) => {
+                    backoff = INITIAL_BACKOFF;
+                    break 'pull Some(raw);
+                }
+                // BRPOP 到时无消息 —— 这也说明链路是通的,可以重置退避
+                Ok(None) => backoff = INITIAL_BACKOFF,
                 Err(e) => {
-                    tracing::warn!(error = %e, "pull_loop: redis error, reconnecting");
+                    tracing::warn!(error = %e, ?backoff, "pull_loop: redis command failed, retrying");
                     conn = None;
+                    // 命令级错误同样要退避。少了这一步,持续性故障(例如集群拓扑
+                    // 判错导致的 MOVED)会变成每秒几十次的热循环,既刷爆日志也
+                    // 白白压 Redis。
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break 'pull None,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
         };
@@ -278,13 +405,15 @@ async fn handle_one(agent: Arc<Agent>, raw: Vec<u8>, _permit: OwnedSemaphorePerm
     if let Err(ref e) = result {
         tracing::debug!(%req_id, error = %e, "request failed");
     }
-    if let Err(e) = send_response(&agent, &req.reply_to, &HttpResponse { req_id, result }).await {
+    if let Err(e) = send_response(&agent, &req, &HttpResponse { req_id, result }).await {
         // Report 展开整条 source 链,否则运维只能看到最外层那句话
         tracing::warn!(%req_id, error = %Report::from_error(e), "failed to write response back to redis");
     }
 }
 
-/// 转发到本地 upstream,返回 Result 语义的结果。
+/// 转发到目标上游,返回 Result 语义的结果。
+///
+/// 目标地址来自请求,但必须先通过 `is_allowed` 的清单校验。
 async fn forward(agent: &Agent, req: &HttpRequest) -> Result<HttpOk, BridgeError> {
     // deadline 先检查:A 已超时离开就不打本地服务,避免无意义负载与重复副作用
     let now = unix_ms_now();
@@ -305,13 +434,26 @@ async fn forward(agent: &Agent, req: &HttpRequest) -> Result<HttpOk, BridgeError
             detail: format!("invalid method {:?}: {e}", req.method),
         }
     })?;
-    let url = agent.upstream.join(&req.uri).map_err(|e| BridgeError::Internal {
-        detail: format!("invalid uri {:?}: {e}", req.uri),
+    // 必须解析为绝对 URL:Url::parse 不接受相对引用,因此不存在「拼到 base 上」
+    // 的余地,目标地址完全显式。
+    let url = req.url.parse::<Url>().map_err(|e| BridgeError::Internal {
+        detail: format!("invalid url {:?}: {e}", req.url),
     })?;
+    // 安全边界:清单之外一律拒绝,且在发出任何网络请求之前就拒绝
+    if !is_allowed(&url, &agent.allowed) {
+        tracing::warn!(%url, req_id = %req.req_id, "rejected: upstream not in allow list");
+        return Err(BridgeError::UpstreamNotAllowed {
+            url: url.to_string(),
+        });
+    }
 
     let mut headers = HeaderMap::new();
     for (name, value) in &req.headers {
-        if is_hop_by_hop(name) {
+        // hop-by-hop 不透传;accept-encoding 也剥掉 —— 交给 reqwest 自己协商并透明
+        // 解压。若把调用方带来的 accept-encoding 透传过去,reqwest 会认为调用方要
+        // 自行处理压缩而**不再解压**,body 就成了压缩流,协议层只能 base64 兜住,
+        // 既不可读也违背这次「文本直存」的目的。
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("accept-encoding") {
             continue;
         }
         let (Ok(n), Ok(v)) = (
@@ -375,34 +517,51 @@ fn map_reqwest_err(e: reqwest::Error) -> BridgeError {
     }
 }
 
-/// 回写响应:LPUSH + EXPIRE 合并为一次往返;EXPIRE 保证 A 实例
-/// 崩溃/下线后其回复队列不会永远留在 Redis 里。
+/// 回写响应。两种投递方式都带 TTL,保证 A 侧崩溃/不来取时 Redis 不会永久残留:
+/// - `Queue`:`LPUSH bridge:resp:{reply_to}` + `EXPIRE`,调用方 BRPOP 阻塞取。
+/// - `Kv`:`SET bridge:resp:{req_id} <resp> EX`,调用方之后按 req_id GET 自取。
 async fn send_response(
     agent: &Agent,
-    reply_to: &str,
+    req: &HttpRequest,
     resp: &HttpResponse,
 ) -> Result<(), AgentError> {
     let payload = encode(resp).context(EncodeSnafu)?;
-    let key = reply_queue(reply_to);
-    let mut conn = agent.redis.get().await.context(PoolSnafu)?;
-    redis::pipe()
-        .cmd("LPUSH")
-        .arg(&key)
-        .arg(payload)
-        .ignore()
-        .cmd("EXPIRE")
-        .arg(&key)
-        .arg(RESP_TTL_SECS)
-        .ignore()
-        .query_async::<()>(&mut conn)
-        .await
-        .context(RedisSnafu)?;
+    let mut conn = agent.redis.conn().await.context(AcquireSnafu)?;
+    match req.reply_mode {
+        ReplyMode::Queue => {
+            let key = agent.keyspace.reply_queue(&req.reply_to);
+            redis::pipe()
+                .cmd("LPUSH")
+                .arg(&key)
+                .arg(payload)
+                .ignore()
+                .cmd("EXPIRE")
+                .arg(&key)
+                .arg(RESP_TTL_SECS)
+                .ignore()
+                .query_async::<()>(&mut conn)
+                .await
+                .context(CommandSnafu)?;
+        }
+        ReplyMode::Kv => {
+            // SET 自带 EX,一次往返即写入 + 设 TTL,无需 pipeline。
+            let key = agent.keyspace.response_kv_key(&req.req_id);
+            redis::cmd("SET")
+                .arg(&key)
+                .arg(payload)
+                .arg("EX")
+                .arg(RESP_KV_TTL_SECS)
+                .query_async::<()>(&mut conn)
+                .await
+                .context(CommandSnafu)?;
+        }
+    }
     Ok(())
 }
 
 /// 可观测性(design §5.4):周期性输出队列积压(最重要的健康指标)与 in-flight 并发。
 async fn metrics_loop(agent: Arc<Agent>, shutdown: CancellationToken) {
-    let queue = request_queue(&agent.service);
+    let queue = agent.keyspace.request_queue(&agent.service);
     let mut tick = tokio::time::interval(METRICS_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -410,7 +569,7 @@ async fn metrics_loop(agent: Arc<Agent>, shutdown: CancellationToken) {
             _ = shutdown.cancelled() => return,
             _ = tick.tick() => {}
         }
-        match agent.redis.get().await {
+        match agent.redis.conn().await {
             Ok(mut conn) => {
                 match redis::cmd("LLEN")
                     .arg(&queue)
@@ -435,4 +594,93 @@ fn unix_ms_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow(entries: &[&str]) -> Vec<Url> {
+        entries.iter().map(|e| e.parse().unwrap()).collect()
+    }
+
+    fn allowed(list: &[&str], target: &str) -> bool {
+        is_allowed(&target.parse().unwrap(), &allow(list))
+    }
+
+    #[test]
+    fn same_origin_passes() {
+        let list = ["http://127.0.0.1:8080"];
+        assert!(allowed(&list, "http://127.0.0.1:8080/"));
+        assert!(allowed(&list, "http://127.0.0.1:8080/api/orders?page=1"));
+    }
+
+    /// origin 的任一部分不同都必须拒绝,这是硬边界。
+    #[test]
+    fn different_origin_rejected() {
+        let list = ["http://127.0.0.1:8080"];
+        assert!(!allowed(&list, "http://127.0.0.1:8081/"), "端口不同");
+        assert!(!allowed(&list, "http://127.0.0.2:8080/"), "主机不同");
+        assert!(!allowed(&list, "https://127.0.0.1:8080/"), "协议不同");
+        assert!(!allowed(&list, "http://evil.example/"), "完全无关的主机");
+        assert!(
+            !allowed(&list, "http://169.254.169.254/latest/meta-data/"),
+            "云元数据服务必须拒绝"
+        );
+    }
+
+    /// 非 http(s) 的 scheme 产生不透明 origin,永远匹配不上。
+    #[test]
+    fn non_http_schemes_rejected() {
+        let list = ["http://127.0.0.1:8080"];
+        assert!(!allowed(&list, "file:///etc/passwd"));
+        assert!(!allowed(&list, "data:text/plain,hi"));
+    }
+
+    #[test]
+    fn multiple_entries() {
+        let list = ["http://127.0.0.1:8080", "http://127.0.0.1:9090"];
+        assert!(allowed(&list, "http://127.0.0.1:8080/a"));
+        assert!(allowed(&list, "http://127.0.0.1:9090/b"));
+        assert!(!allowed(&list, "http://127.0.0.1:7070/c"));
+    }
+
+    /// 清单项带路径时限制在子树内,且必须按段边界比较。
+    #[test]
+    fn path_scoping() {
+        let list = ["http://127.0.0.1:8080/api"];
+        assert!(allowed(&list, "http://127.0.0.1:8080/api"));
+        assert!(allowed(&list, "http://127.0.0.1:8080/api/orders"));
+        assert!(!allowed(&list, "http://127.0.0.1:8080/admin"));
+        assert!(
+            !allowed(&list, "http://127.0.0.1:8080/apifoo"),
+            "/api 不能放行 /apifoo"
+        );
+    }
+
+    /// Url::parse 会规范化 `..`,所以穿越后落在清单外就会被拒。
+    #[test]
+    fn dot_segments_are_normalized_then_checked() {
+        let list = ["http://127.0.0.1:8080/api"];
+        let u: Url = "http://127.0.0.1:8080/api/../admin".parse().unwrap();
+        assert_eq!(u.path(), "/admin", "解析阶段已规范化");
+        assert!(!is_allowed(&u, &allow(&list)));
+    }
+
+    /// 百分号编码的 `.` `/` 不会被 Url 解码,但上游可能解码,因此有路径限制时直接拒绝。
+    #[test]
+    fn percent_encoded_traversal_rejected() {
+        let list = ["http://127.0.0.1:8080/api"];
+        assert!(!allowed(&list, "http://127.0.0.1:8080/api/%2e%2e/admin"));
+        assert!(!allowed(&list, "http://127.0.0.1:8080/api/%2E%2E/admin"));
+        assert!(!allowed(&list, "http://127.0.0.1:8080/api/x%2fy"));
+    }
+
+    /// 清单项只有 origin(路径为空或 /)时不做路径限制,编码字符也不该误伤。
+    #[test]
+    fn origin_only_entry_allows_any_path() {
+        let list = ["http://127.0.0.1:8080/"];
+        assert!(allowed(&list, "http://127.0.0.1:8080/anything/at/all"));
+        assert!(allowed(&list, "http://127.0.0.1:8080/items/a%20b"));
+    }
 }

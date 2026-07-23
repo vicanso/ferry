@@ -5,8 +5,10 @@ edition.workspace = true
 
 [dependencies]
 bridge-protocol.workspace = true
+bridge-redis.workspace = true
+serde.workspace = true
+tibba-config.workspace = true
 bytes.workspace = true
-deadpool-redis.workspace = true
 reqwest.workspace = true
 snafu.workspace = true
 # main → macros/rt-multi-thread,ctrl_c → signal,Semaphore → sync,interval/sleep → time

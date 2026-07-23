@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""把 ferry 队列里的报文打印成人类可读的形式,body 自动解 base64。
+"""把 ferry 队列里的报文打印成人类可读的形式。
 
-线上格式用 base64 是为了能原样承载任意字节(gzip 响应、图片、protobuf),
-可读性由这个脚本补回来,不需要牺牲协议的透明性。
+请求和响应的 body 都按 `body_encoding` 处理:`utf8`(或缺省)是原文、直接展示,`base64`
+才解码(二进制给十六进制预览)。所以对文本报文这脚本基本不用做事,原文本来就可读。
 
 用法:
     scripts/ferry-dump.py req demo          # 看 bridge:req:demo 的积压
@@ -28,8 +28,8 @@ def redis_lrange(key, limit):
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
-def decode_body(b64):
-    """返回 (展示用文本, 说明)。二进制 body 不强行解码,给出十六进制预览。"""
+def decode_base64_body(b64):
+    """base64 body → (展示用文本, 说明)。二进制给十六进制预览,不强行解码。"""
     if not b64:
         return "", "空"
     raw = base64.b64decode(b64)
@@ -41,18 +41,28 @@ def decode_body(b64):
         return f"<二进制 {preview}...>", f"{len(raw)} 字节二进制{hint}"
 
 
+def decode_body_field(obj):
+    """按 body_encoding 解读带 body 的对象(请求 / 响应 Ok 通用)。
+    utf8(或缺省)是原文直取,base64 才解码。"""
+    body = obj.get("body") or ""
+    if obj.get("body_encoding", "utf8") == "base64":
+        return decode_base64_body(body)
+    if not body:
+        return "", "空"
+    return body, f"{len(body.encode('utf-8'))} 字节 UTF-8(原文)"
+
+
 def render(msg):
     """就地把 body 字段换成可读形式,并附一行尺寸说明。"""
-    if "body" in msg:
-        msg["body"], note = decode_body(msg["body"])
+    if "body" in msg:  # 请求
+        msg["body"], note = decode_body_field(msg)
         msg["_body_info"] = note
     result = msg.get("result")
-    if isinstance(result, dict):
-        for branch in ("Ok", "Err"):
-            inner = result.get(branch)
-            if isinstance(inner, dict) and "body" in inner:
-                inner["body"], note = decode_body(inner["body"])
-                inner["_body_info"] = note
+    if isinstance(result, dict):  # 响应:只有 Ok 带 body
+        ok = result.get("Ok")
+        if isinstance(ok, dict) and "body" in ok:
+            ok["body"], note = decode_body_field(ok)
+            ok["_body_info"] = note
     return msg
 
 

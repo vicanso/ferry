@@ -1,0 +1,134 @@
+name: Docker
+
+# 推送 v* tag 时触发。docker-merge 会从 tag 名解析版本号(去掉前缀 v),
+# 所以务必用 `git tag v0.1.0 && git push origin v0.1.0` 这种带版本的 tag 触发。
+on:
+  push:
+    tags:
+      - "v*"
+
+# Docker Hub 用 username/token 认证,不需要 packages 写权限;仓库只读即可。
+permissions:
+  contents: read
+
+# 同一个 ref 的重复触发只保留最新一次
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Docker Hub 目标仓库,格式 namespace/repo。改成你自己的账号。
+  # namespace 必须是登录账号(DOCKER_HUB_USERNAME 对应的)有 push 权限的命名空间。
+  IMAGE_NAME: vicanso/ferry
+
+jobs:
+  docker-build:
+    timeout-minutes: 3600
+    runs-on: ${{ matrix.platform.runs-on }}
+    strategy:
+      # 一个架构失败不牵连另一个
+      fail-fast: false
+      matrix:
+        platform:
+          - { arch: "linux/amd64", tag: "amd64", runs-on: "ubuntu-24.04" }
+          - { arch: "linux/arm64", tag: "arm64", runs-on: "ubuntu-24.04-arm" }
+    steps:
+      - name: Change Swap Space
+        run: |
+          swapon --show=NAME | tail -n 1
+          df -lh
+          if [ -d /usr/local/lib/android ]; then
+            du -sh /usr/local/lib/android
+            sudo rm -rf /usr/local/lib/android
+          fi
+          export SWAP_FILE=$(swapon --show=NAME | tail -n 1)
+          sudo swapoff $SWAP_FILE
+          sudo rm $SWAP_FILE
+          export SWAP_FILE=/swapfile
+          sudo fallocate -l 16G $SWAP_FILE
+          sudo chmod 600 $SWAP_FILE
+          sudo mkswap $SWAP_FILE
+          sudo swapon $SWAP_FILE
+      - name: Swap space report after modification
+        shell: bash
+        run: |
+          echo "Memory and swap:"
+          free -h
+          echo
+          swapon --show
+          df -lh
+          echo
+          arch
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform.arch }}
+          # 跨 CI 复用 Rust 依赖编译层,不然每次都从头编几百个 crate。
+          # scope 按架构分开,避免 amd64/arm64 互相污染缓存。
+          cache-from: type=gha,scope=${{ matrix.platform.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform.tag }}
+          # Push by digest only: no per-arch (:amd64/:arm64) tag is created
+          # on Docker Hub. The `docker-merge` job below assembles the single
+          # versioned manifest.
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.docker_build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.tag }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    runs-on: ubuntu-24.04
+    needs: [docker-build]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Extract version from Git tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+      - name: Create and push multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        # Tag the same manifest with both the version (e.g. `0.8.5`) and
+        # `latest`. `imagetools create` accepts multiple `-t` and only
+        # writes manifest references — no blobs are re-uploaded.
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:${{ env.VERSION }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:latest

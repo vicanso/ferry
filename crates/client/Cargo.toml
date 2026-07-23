@@ -5,9 +5,9 @@ edition.workspace = true
 
 [dependencies]
 bridge-protocol.workspace = true
+bridge-redis.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
-deadpool-redis.workspace = true
 snafu.workspace = true
 # select! → macros,spawn → rt,oneshot → sync,timeout/sleep → time
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

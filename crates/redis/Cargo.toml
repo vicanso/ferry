@@ -1,0 +1,10 @@
+[package]
+name = "bridge-redis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snafu.workspace = true
+tibba-cache.workspace = true
+tibba-config.workspace = true
+tibba-error.workspace = true

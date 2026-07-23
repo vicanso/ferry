@@ -10,29 +10,37 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use deadpool_redis::redis;
-use deadpool_redis::{Pool, Runtime};
+use bridge_redis::RedisClient;
+use bridge_redis::redis;
 use snafu::prelude::*;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use bridge_protocol::{
-    decode, encode, reply_queue, request_queue, BridgeError, CodecError, HttpOk, HttpRequest,
-    HttpResponse, MAX_BODY_SIZE,
+    decode, encode, BridgeError, CodecError, HttpOk, HttpRequest, HttpResponse, Keyspace,
+    ReplyMode, DEFAULT_KEY_PREFIX, MAX_BODY_SIZE,
 };
 
 /// BRPOP 的阻塞时长。由于 BRPOP 发出后不可取消,这个值同时是
 /// 「关闭 / 断线被感知」的延迟上限。
-const BRPOP_TIMEOUT_SECS: u64 = 2;
+/// BRPOP 的最长阻塞时长。BRPOP 发出后不可取消,所以它同时是「关闭 / 断线被感知」
+/// 的延迟上限;专用连接的 response timeout 也由它推导。
+const MAX_BLOCK: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// 一个或多个节点地址,逗号分隔。配多个即按集群处理;只配一个时会用
+    /// `CLUSTER INFO` 探测,所以单地址的集群(如托管服务的 configuration
+    /// endpoint)也能被正确识别。
     pub redis_url: String,
-    /// 目标服务名,对应请求队列 `bridge:req:{service}`。
+    /// 目标服务名,对应请求队列 `{key_prefix}:req:{service}`。
     pub service: String,
+    /// Redis key 前缀,默认 `bridge`。**必须与 agent 侧配置一致**,否则两端用不同
+    /// 的 key、彼此看不到。留空回退默认。用 [`Config::with_key_prefix`] 覆盖。
+    pub key_prefix: String,
 }
 
 impl Config {
@@ -40,7 +48,15 @@ impl Config {
         Self {
             redis_url: redis_url.into(),
             service: service.into(),
+            key_prefix: DEFAULT_KEY_PREFIX.to_string(),
         }
+    }
+
+    /// 覆盖 Redis key 前缀(需与 agent 侧一致)。
+    #[must_use]
+    pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.key_prefix = prefix.into();
+        self
     }
 }
 
@@ -49,7 +65,9 @@ impl Config {
 #[derive(Debug, Clone)]
 pub struct CallRequest {
     pub method: String,
-    pub uri: String,
+    /// 完整的绝对 URL,例如 `http://10.0.0.5:8080/api/foo?x=1`。
+    /// agent 侧会拿它比对允许清单,不在清单内会返回 `UpstreamNotAllowed`。
+    pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
     pub timeout: Duration,
@@ -66,23 +84,21 @@ pub enum CallError {
     TooLarge { size: usize, limit: usize },
     #[snafu(display("failed to encode the request"))]
     Encode { source: CodecError },
-    #[snafu(display("failed to create the redis pool"))]
-    CreatePool {
-        source: deadpool_redis::CreatePoolError,
-    },
-    #[snafu(display("failed to open a dedicated redis connection"))]
-    RedisConnect { source: redis::RedisError },
-    #[snafu(display("redis pool is unavailable"))]
-    Pool { source: deadpool_redis::PoolError },
+    #[snafu(display("redis connection failed"))]
+    Redis { source: bridge_redis::Error },
+    /// 从 tibba-cache 借用连接失败(池耗尽、连接建立失败等)
+    #[snafu(display("failed to acquire a redis connection"))]
+    Acquire { source: bridge_redis::CacheError },
     #[snafu(display("redis command failed"))]
-    Redis { source: redis::RedisError },
+    Command { source: redis::RedisError },
     #[snafu(display("client is shut down"))]
     Closed,
 }
 
 pub struct BridgeClient {
-    pool: Pool,
+    redis: Arc<RedisClient>,
     service: String,
+    keyspace: Keyspace,
     instance_id: String,
     pending: Arc<DashMap<Uuid, oneshot::Sender<HttpResponse>>>,
     shutdown: CancellationToken,
@@ -91,17 +107,14 @@ pub struct BridgeClient {
 impl BridgeClient {
     /// 建池、生成 instance_id、spawn 后台 reply_loop。
     pub async fn start(cfg: Config) -> Result<Self, CallError> {
-        let pool = deadpool_redis::Config::from_url(&cfg.redis_url)
-            .create_pool(Some(Runtime::Tokio1))
-            .context(CreatePoolSnafu)?;
-        // fail fast:启动时先验证 Redis 可达
-        {
-            let mut conn = pool.get().await.context(PoolSnafu)?;
-            redis::cmd("PING")
-                .query_async::<()>(&mut conn)
-                .await
-                .context(RedisSnafu)?;
-        }
+        // 连接池、拓扑判定、超时全部由 tibba-cache 负责,这里不关心拓扑
+        let redis = Arc::new(bridge_redis::connect(&cfg.redis_url).context(RedisSnafu)?);
+        let keyspace = Keyspace::new(&cfg.key_prefix);
+        tracing::info!(
+            cluster = redis.is_cluster(),
+            key_prefix = keyspace.prefix(),
+            "redis connected"
+        );
 
         let instance_id = Uuid::new_v4().simple().to_string();
         let pending: Arc<DashMap<Uuid, oneshot::Sender<HttpResponse>>> =
@@ -109,17 +122,17 @@ impl BridgeClient {
         let shutdown = CancellationToken::new();
 
         // reply_loop 独占一条连接做阻塞 BRPOP,不能从连接池借
-        let dedicated = redis::Client::open(cfg.redis_url.as_str()).context(RedisConnectSnafu)?;
         tokio::spawn(reply_loop(
-            dedicated,
-            reply_queue(&instance_id),
+            Arc::clone(&redis),
+            keyspace.reply_queue(&instance_id),
             Arc::clone(&pending),
             shutdown.clone(),
         ));
 
         Ok(Self {
-            pool,
+            redis,
             service: cfg.service,
+            keyspace,
             instance_id,
             pending,
             shutdown,
@@ -146,8 +159,10 @@ impl BridgeClient {
         let wire = HttpRequest {
             req_id,
             reply_to: self.instance_id.clone(),
+            // bridge-client 同步等待,用队列模式在一条阻塞连接上收全部响应
+            reply_mode: ReplyMode::Queue,
             method: req.method,
-            uri: req.uri,
+            url: req.url,
             headers: req.headers,
             body: req.body,
             deadline: unix_ms_now() + timeout.as_millis() as u64,
@@ -163,13 +178,13 @@ impl BridgeClient {
         };
 
         {
-            let mut conn = self.pool.get().await.context(PoolSnafu)?;
+            let mut conn = self.redis.conn().await.context(AcquireSnafu)?;
             redis::cmd("LPUSH")
-                .arg(request_queue(&self.service))
+                .arg(self.keyspace.request_queue(&self.service))
                 .arg(&payload)
                 .query_async::<i64>(&mut conn)
                 .await
-                .context(RedisSnafu)?;
+                .context(CommandSnafu)?;
         }
 
         match tokio::time::timeout(timeout, rx).await {
@@ -205,25 +220,25 @@ impl Drop for PendingGuard<'_> {
 /// 后台单任务:一条专用连接,循环 BRPOP 本实例的回复队列并路由给等待者。
 /// 断线按指数退避自愈(design §5.5)。
 async fn reply_loop(
-    client: redis::Client,
+    redis_client: Arc<RedisClient>,
     queue: String,
     pending: Arc<DashMap<Uuid, oneshot::Sender<HttpResponse>>>,
     shutdown: CancellationToken,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut brpop = redis::cmd("BRPOP");
-    brpop.arg(&queue).arg(BRPOP_TIMEOUT_SECS);
+    // 服务端超时与连接的 response timeout 同源,不会互相对不上
+    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(MAX_BLOCK));
     'reconnect: loop {
         if shutdown.is_cancelled() {
             return;
         }
         let mut conn = tokio::select! {
             _ = shutdown.cancelled() => return,
-            c = client.get_multiplexed_async_connection() => match c {
-                Ok(c) => {
-                    backoff = INITIAL_BACKOFF;
-                    c
-                }
+            c = redis_client.dedicated_blocking_conn(MAX_BLOCK) => match c {
+                // 不在这里重置 backoff:「连得上但命令一直失败」的故障(如 MOVED)
+                // 每次重连都成功,在此重置会让退避归零、退化成热循环。
+                Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, ?backoff, "reply_loop: redis connect failed, retrying");
                     tokio::select! {
@@ -258,10 +273,15 @@ async fn reply_loop(
                         tracing::warn!(error = %e, "reply_loop: undecodable reply dropped");
                     }
                 },
-                // BRPOP 到时无消息,回头检查 shutdown 再继续
-                Ok(None) => {}
+                // BRPOP 到时无消息 —— 链路是通的,重置退避
+                Ok(None) => backoff = INITIAL_BACKOFF,
                 Err(e) => {
-                    tracing::warn!(error = %e, "reply_loop: redis error, reconnecting");
+                    tracing::warn!(error = %e, ?backoff, "reply_loop: redis command failed, retrying");
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue 'reconnect;
                 }
             }

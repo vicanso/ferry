@@ -21,7 +21,9 @@ async fn run() -> Result<(), Whatever> {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let service = std::env::var("BRIDGE_SERVICE").unwrap_or_else(|_| "demo".into());
-    let uri = std::env::args().nth(1).unwrap_or_else(|| "/".into());
+    let url = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "http://127.0.0.1:8080/".into());
 
     let client = BridgeClient::start(Config::new(redis_url, service))
         .await
@@ -32,7 +34,7 @@ async fn run() -> Result<(), Whatever> {
     let resp = client
         .call(CallRequest {
             method: "GET".into(),
-            uri,
+            url,
             headers: vec![("accept".into(), "*/*".into())],
             body: Bytes::new(),
             timeout: Duration::from_secs(10),
