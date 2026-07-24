@@ -1,20 +1,21 @@
 name: Docker
 
-# 推送 v* tag 时触发。docker-merge 会从 tag 名解析版本号(去掉前缀 v),
-# 所以务必用 `git tag v0.1.0 && git push origin v0.1.0` 这种带版本的 tag 触发。
+# main 分支每次 push(commit)都构建并推送镜像。每次打两个 tag:latest(指向最新一次
+# main 构建)和 sha-<短SHA>(每个 commit 的不可变引用,便于精确指向 / 回滚)。
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
 # Docker Hub 用 username/token 认证,不需要 packages 写权限;仓库只读即可。
 permissions:
   contents: read
 
-# 同一个 ref 的重复触发只保留最新一次
+# 按 commit 分组:每个 commit 独立成组、互不取消,保证每次 commit 都真正构建一次
+#(而不是被后一次提交抢占掉)。
 concurrency:
-  group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-${{ github.sha }}
+  cancel-in-progress: false
 
 env:
   # Docker Hub 目标仓库,格式 namespace/repo。改成你自己的账号。
@@ -116,19 +117,19 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      - name: Extract version from Git tag
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+      - name: Derive image tag from commit SHA
+        run: echo "SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
       - name: Create and push multi-arch manifest
         working-directory: ${{ runner.temp }}/digests
-        # Tag the same manifest with both the version (e.g. `0.8.5`) and
-        # `latest`. `imagetools create` accepts multiple `-t` and only
-        # writes manifest references — no blobs are re-uploaded.
+        # 同一个 manifest 打两个 tag:latest(最新一次 main 构建)和 sha-<短SHA>
+        # (每个 commit 的不可变引用)。imagetools create 支持多个 -t,只写 manifest
+        # 引用,不重复上传 blob。
         run: |
           docker buildx imagetools create \
-            -t ${{ env.IMAGE_NAME }}:${{ env.VERSION }} \
             -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:sha-${{ env.SHA_SHORT }} \
             $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
           docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:latest
+          docker buildx imagetools inspect ${{ env.IMAGE_NAME }}:sha-${{ env.SHA_SHORT }}
