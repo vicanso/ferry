@@ -33,7 +33,7 @@ B 侧(可启动多个实例,Redis List 天然负载均衡):
 ```bash
 FERRY__REDIS__URI=redis://127.0.0.1:6379 \
 FERRY__AGENT__SERVICE=demo \
-FERRY__AGENT__ALLOWED_UPSTREAMS=http://127.0.0.1:8080,http://127.0.0.1:9090/api \
+FERRY__AGENT__UPSTREAMS=grok=http://127.0.0.1:8080,api=http://127.0.0.1:9090/api \
 cargo run -p bridge-agent
 ```
 
@@ -49,11 +49,26 @@ cargo run -p bridge-agent
 |---|---|---|
 | `redis.uri` | `FERRY__REDIS__URI` | 支持聚合写法,密码只写一次 |
 | `agent.service` | `FERRY__AGENT__SERVICE` | 消费哪个服务的队列 |
-| `agent.allowed_upstreams` | `FERRY__AGENT__ALLOWED_UPSTREAMS` | 准入清单,**留空拒绝启动** |
+| `agent.upstreams` | `FERRY__AGENT__UPSTREAMS` | 服务名 → 真实上游(base URL,可选注入 header),**留空拒绝启动** |
 | `agent.max_concurrency` | `FERRY__AGENT__MAX_CONCURRENCY` | 在途请求上限 |
 
-目标地址由调用方在消息里给出,`allowed_upstreams` 是 B 侧的准入清单。配置文件里可
-写成数组,环境变量则用逗号分隔。**不配置则拒绝启动** —— 空清单等于开放代理。
+调用方只在消息里写**逻辑地址** `https://{服务名}/path`,服务名对应的真实 host 由
+`agent.upstreams` 指定 —— 这样 Redis 里只出现服务名,真实上游地址不外泄,调用方也无法
+指向任意内网地址。配置文件里 `[agent.upstreams]` 写成表,环境变量用单个变量带整表
+(`grok=http://...,api=http://...`,逗号分隔)。服务名不在映射内一律拒绝;**留空则拒绝启动**。
+
+每个服务还能配**注入 header**:转发到该上游时附加,并**覆盖调用方的同名 header**
+(config wins)。适合放调用方不该经手的凭证(`Authorization`、内网签名头等)—— 这样连
+密钥都不进 Redis。配置文件里写 `[agent.upstreams.<服务>.headers]` 子表;环境变量用嵌套写法
+`FERRY__AGENT__UPSTREAMS__<服务>__HEADERS__<NAME>=...`(带 header 时不能再用逗号简写,
+两种形状不同)。注入的 header 值在启动时即校验,非法立即报错,且不会进日志。
+
+```toml
+[agent.upstreams.grok]
+base = "http://10.51.0.5:7257"
+[agent.upstreams.grok.headers]
+authorization = "Bearer sk-..."   # 调用方不必再发,Redis 里也看不到
+```
 
 Redis 连接池参数(`pool_size`、`connection_timeout` 等)写在 URI 的查询串里,
 由 tibba-cache 解析:
@@ -71,7 +86,7 @@ docker build -t ferry-agent .
 docker run --rm --network host \
   -e FERRY__REDIS__URI=redis://127.0.0.1:6379 \
   -e FERRY__AGENT__SERVICE=demo \
-  -e FERRY__AGENT__ALLOWED_UPSTREAMS=http://127.0.0.1:8080 \
+  -e FERRY__AGENT__UPSTREAMS=grok=http://127.0.0.1:8080 \
   ferry-agent
 ```
 
@@ -85,7 +100,8 @@ A 侧:
 let client = BridgeClient::start(Config::new("redis://127.0.0.1:6379", "demo")).await?;
 let resp = client.call(CallRequest {
     method: "GET".into(),
-    url: "http://127.0.0.1:8080/api/foo?x=1".into(),
+    // 逻辑地址:host 是服务名 grok,真实 host 由 agent 的 upstreams 配置决定
+    url: "https://grok/api/foo?x=1".into(),
     headers: vec![("accept".into(), "*/*".into())],
     body: Bytes::new(),
     timeout: Duration::from_secs(10),
@@ -117,11 +133,14 @@ string 的 `SET … EX` 每条响应独立过期、自动清理,且 `bridge:resp
 **B 侧任何失败都显式回写错误响应。** 本地服务挂了、超时、请求已过期,都回一条
 `BridgeError`。否则 A 只能干等到超时,且无法区分「B 没收到」和「B 处理失败」。
 
-**目标地址在消息里,准入清单在 agent 侧。** 调用方给出完整 URL,agent 拿它比对
-`agent.allowed_upstreams`,不在清单内就直接拒绝、不发出任何网络请求。这条边界决定了
-ferry 是「通向若干指定服务的桥」而不是「通向 B 内网的隧道」—— 少了它,任何能往
-Redis 队列 LPUSH 的人都能让 agent 去读云元数据服务的实例凭证。匹配按 origin
-严格比对,并且**禁用了自动重定向**,免得上游用一个 302 把 agent 骗进内网。
+**调用方给服务名,真实地址在 agent 侧。** 消息里的 `url` 是逻辑地址 `https://{服务名}/path`,
+agent 拿服务名查 `agent.upstreams` 得到真实 base URL,再拼上请求的 path/query 去调用;
+scheme/host/port 全部来自配置,调用方碰不到。这条边界决定了 ferry 是「通向若干指定服务的
+桥」而不是「通向 B 内网的隧道」—— 真实上游地址既不进 Redis,调用方也无法把 agent 指向
+任意内网地址(比如云元数据服务)。服务名不在映射内一律拒绝、不发任何网络请求,并**禁用
+自动重定向**,免得上游用一个 302 把 agent 骗进内网。若映射值带 base path,则请求被限制在
+该子树内(拒绝 `%2e`/`%2f` 编码穿越)。每个服务还可在配置里指定**注入 header**(转发时
+覆盖调用方同名),把 `Authorization` 之类凭证也留在 B 侧配置 —— 连密钥都不必进 Redis。
 
 **先拿 semaphore 许可,再 BRPOP。** 顺序反了就变成「拉进来再排队」,请求堆在进程内存里。
 先拿许可等于告诉 Redis「我忙不过来,暂时别给我」,队列本身成为缓冲区,这就是背压。

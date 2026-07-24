@@ -3,8 +3,8 @@
 //! 验证 design §3 的核心主张 —— 无论并发多少,A 侧只占用 1 条阻塞连接
 //! (reply_loop)+ 1 个普通连接池,响应靠 req_id 在进程内路由回各自的调用者。
 //!
-//! 用法:
-//!   BRIDGE_SERVICE=demo cargo run -p bridge-client --example concurrent -- 100 /index.html
+//! 用法(第二个参数是逻辑地址 https://{服务名}/path):
+//!   BRIDGE_SERVICE=demo cargo run -p bridge-client --example concurrent -- 100 https://demo/index.html
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ async fn run() -> Result<(), Whatever> {
         .whatever_context("first argument must be a request count")?;
     let target = args
         .next()
-        .unwrap_or_else(|| "http://127.0.0.1:8080/".into());
+        .unwrap_or_else(|| "https://demo/".into());
 
     let client = Arc::new(
         BridgeClient::start(Config::new(redis_url, service))

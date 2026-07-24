@@ -52,11 +52,10 @@ pub struct HttpRequest {
     pub reply_mode: ReplyMode,
     /// GET / POST / ...
     pub method: String,
-    /// 完整的绝对 URL,例如 `http://10.0.0.5:8080/api/foo?x=1`。
-    ///
-    /// 目标地址由调用方给出,但 agent 会拿它和自己配置的允许清单比对,不在
-    /// 清单内一律拒绝(`BridgeError::UpstreamNotAllowed`)。决定权始终在 B 侧,
-    /// 否则 agent 就成了 B 所在内网里的开放代理。
+    /// 逻辑地址:`https://{服务名}/path?query`。host 段是**服务名**而非真实主机,
+    /// scheme 只是占位、会被忽略。真实 scheme + host + port 由 agent 的 `upstreams`
+    /// 配置决定,所以 Redis 里只出现服务名,真实上游地址不外泄。服务名不在映射内
+    /// 一律拒绝(`BridgeError::UnknownUpstream`),决定权始终在 B 侧。
     pub url: String,
     /// header value 用 String 而非字节:HTTP 规范允许任意字节,但实践中都是
     /// ASCII,用 String 才能让 JSON 保持可读。非 UTF-8 的值会被 lossy 转换。
@@ -217,9 +216,9 @@ impl<'de> Deserialize<'de> for HttpOk {
 pub enum BridgeError {
     #[snafu(display("upstream unreachable: {detail}"))]
     UpstreamUnreachable { detail: String },
-    /// 目标地址不在 agent 配置的允许清单内。这是安全边界被触发,不是故障。
-    #[snafu(display("upstream {url} is not in the allow list"))]
-    UpstreamNotAllowed { url: String },
+    /// 请求里的服务名不在 agent 配置的 upstreams 映射内。安全边界被触发,不是故障。
+    #[snafu(display("unknown upstream service {service:?}"))]
+    UnknownUpstream { service: String },
     #[snafu(display("upstream timeout"))]
     UpstreamTimeout,
     #[snafu(display("request expired before being handled"))]

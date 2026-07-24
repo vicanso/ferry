@@ -24,10 +24,27 @@ service = "demo"
 # 留空 / 删除本行则回退默认 bridge。
 key_prefix = "bridge"
 
-# 允许被访问的上游清单。**留空则拒绝启动** —— 空清单等于开放代理。
-# 可写成数组,也可写成逗号分隔的字符串(环境变量只能用后者)。
-# 匹配按 origin(scheme+host+port)严格比对;带路径则额外限制在该子树内。
-allowed_upstreams = []
-
 # 同时在途的请求数上限,也是 semaphore 的许可总数
 max_concurrency = 64
+
+# 服务名 → 真实上游。调用方只写 https://{服务名}/path,真实 host(以及可选的注入
+# header)只在这里、不进 Redis;服务名不在表里就拒绝,**留空则拒绝启动**。
+#
+# 两种写法:
+#   1) 裸字符串 —— 只有 base、不注入 header:
+#        grok = "http://10.51.0.5:7257"
+#   2) base + headers 的表 —— 转发时注入这些 header,**覆盖调用方同名**(config wins),
+#      适合放调用方不该经手的凭证(值在启动时校验,且不会进日志):
+#        [agent.upstreams.grok]
+#        base = "http://10.51.0.5:7257"
+#        [agent.upstreams.grok.headers]
+#        authorization = "Bearer sk-..."
+#
+# 环境变量:无 header 用逗号分隔的整表简写
+#   FERRY__AGENT__UPSTREAMS=grok=http://10.51.0.5:7257,api=http://127.0.0.1:8080/api
+# 带 header 用嵌套写法(密钥留在 env、不进 Redis;此时不能再用上面的逗号简写)
+#   FERRY__AGENT__UPSTREAMS__GROK__BASE=http://10.51.0.5:7257
+#   FERRY__AGENT__UPSTREAMS__GROK__HEADERS__AUTHORIZATION=Bearer sk-...
+[agent.upstreams]
+# grok = "http://10.51.0.5:7257"
+# api  = "http://127.0.0.1:8080/api"

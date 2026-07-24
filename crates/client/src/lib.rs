@@ -65,8 +65,8 @@ impl Config {
 #[derive(Debug, Clone)]
 pub struct CallRequest {
     pub method: String,
-    /// 完整的绝对 URL,例如 `http://10.0.0.5:8080/api/foo?x=1`。
-    /// agent 侧会拿它比对允许清单,不在清单内会返回 `UpstreamNotAllowed`。
+    /// 逻辑地址 `https://{服务名}/path?query`,host 是服务名而非真实主机。
+    /// agent 按配置把服务名解析成真实上游;服务名不存在会返回 `UnknownUpstream`。
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,

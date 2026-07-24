@@ -5,6 +5,7 @@
 //! 2. 拉取到请求先查 deadline,已过期直接回 `Expired`,不打本地服务;
 //! 3. 回写用 pipeline(LPUSH + EXPIRE),EXPIRE 是防泄漏保险丝。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,15 +34,32 @@ const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Snafu)]
 enum AgentError {
-    #[snafu(display("agent.allowed_upstreams entry {url:?} is not a valid URL"))]
-    AllowedUpstream { source: url::ParseError, url: String },
+    #[snafu(display("agent.upstreams service {service:?} -> {url:?} is not a valid URL"))]
+    InvalidUpstream {
+        source: url::ParseError,
+        service: String,
+        url: String,
+    },
     #[snafu(display(
-        "agent.allowed_upstreams is empty; refusing to start (an agent with no allow list \
-         would be an open proxy into this network)"
+        "agent.upstreams is empty; refusing to start (no service is reachable — \
+         an empty map almost always means the upstream config is missing)"
     ))]
-    EmptyAllowList,
-    #[snafu(display("agent.allowed_upstreams entry {url:?} must use http or https"))]
-    NonHttpUpstream { url: String },
+    EmptyUpstreams,
+    #[snafu(display("agent.upstreams service {service:?} -> {url:?} must use http or https"))]
+    NonHttpUpstream { service: String, url: String },
+    #[snafu(display("agent.upstreams service {service:?} has an invalid header name {name:?}"))]
+    InvalidHeaderName {
+        source: reqwest::header::InvalidHeaderName,
+        service: String,
+        name: String,
+    },
+    // 只记 header 名,不记值 —— 注入的 header 往往是凭证,值绝不能进错误 / 日志。
+    #[snafu(display("agent.upstreams service {service:?} header {name:?} has an invalid value"))]
+    InvalidHeaderValue {
+        source: reqwest::header::InvalidHeaderValue,
+        service: String,
+        name: String,
+    },
     #[snafu(display("failed to read the config file {path:?}"))]
     ReadConfig {
         source: std::io::Error,
@@ -67,13 +85,24 @@ enum AgentError {
 struct Agent {
     redis: Arc<RedisClient>,
     http: reqwest::Client,
-    /// 允许被访问的上游清单。目标 URL 由请求方给出,但必须落在这里面。
-    allowed: Vec<Url>,
+    /// 服务名 → 真实上游(base URL + 注入 header)。调用方只给服务名,真实地址与
+    /// 注入的凭证都只存在这里、不进 Redis。
+    upstreams: HashMap<String, Upstream>,
     sem: Arc<Semaphore>,
     service: String,
     /// Redis key 命名空间(前缀可配)。请求队列 / 回复都经它拼 key。
     keyspace: Keyspace,
     max_concurrency: usize,
+}
+
+/// 一个上游服务的解析后配置。
+struct Upstream {
+    /// 真实 base URL(scheme+host+port,可带 base path)。
+    base: Url,
+    /// 转发时注入的 header,已在启动时解析校验。**覆盖调用方同名 header**(config wins),
+    /// 因此适合放调用方不该经手的凭证(`Authorization` 等)。value 标记为 sensitive:
+    /// 不进 `Debug` 输出、HTTP/2 下也不做 HPACK 索引。
+    headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 /// 烘焙进二进制的默认配置,保证不挂任何文件也能启动。
@@ -83,28 +112,52 @@ const DEFAULT_CONFIG: &str = include_str!("../config/default.toml");
 const CONFIG_PATH_ENV: &str = "FERRY_CONFIG";
 const ENV_PREFIX: &str = "FERRY";
 
-/// 既接受 TOML 数组,也接受逗号分隔的字符串。
+/// `upstreams` 映射的两种写法:TOML 表(推荐),或单个 `"name=url,name2=url2"` 字符串。
 ///
-/// 环境变量只能表达后者 —— tibba-config 没给 config-rs 设 `list_separator`,
-/// 所以 `FERRY__AGENT__ALLOWED_UPSTREAMS=a,b` 反序列化成 `Vec<String>` 会失败。
-/// 用 untagged 同时容纳两种写法,配置文件里可以写得好看,环境变量也能覆盖。
+/// 单字符串(CSV)是给环境变量的简写 —— 一个 env 变量带整张表,例如
+/// `FERRY__AGENT__UPSTREAMS=grok=http://10.0.0.5:7257,api=http://127.0.0.1:8080`。
+/// 因此 base URL 里不应含 `,` 或 `=`(纯 host[+basepath] 本就不该有)。CSV 形式
+/// **只能表达 base、不能带注入 header**;要注入 header 用 TOML 表,或环境变量的嵌套写法
+/// `FERRY__AGENT__UPSTREAMS__GROK__BASE=...` + `..__HEADERS__AUTHORIZATION=...`。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum StringList {
+enum UpstreamSpec {
+    Map(HashMap<String, UpstreamEntry>),
     Csv(String),
-    List(Vec<String>),
 }
 
-impl StringList {
-    fn into_vec(self) -> Vec<String> {
+/// 单个 upstream 的写法:裸 URL 字符串(简写,无注入 header),或带 `base` + `headers`
+/// 的表。untagged —— 字符串走 `Bare`、表走 `Full`,两者形状不同不会歧义。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum UpstreamEntry {
+    Bare(String),
+    Full {
+        base: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+impl Default for UpstreamSpec {
+    fn default() -> Self {
+        UpstreamSpec::Map(HashMap::new())
+    }
+}
+
+impl UpstreamSpec {
+    fn into_map(self) -> HashMap<String, UpstreamEntry> {
         match self {
-            StringList::Csv(s) => s
+            UpstreamSpec::Map(m) => m,
+            UpstreamSpec::Csv(s) => s
                 .split(',')
                 .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
+                .filter(|e| !e.is_empty())
+                .filter_map(|e| e.split_once('='))
+                .map(|(k, v)| (k.trim(), v.trim()))
+                .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                .map(|(k, v)| (k.to_owned(), UpstreamEntry::Bare(v.to_owned())))
                 .collect(),
-            StringList::List(v) => v.into_iter().filter(|s| !s.trim().is_empty()).collect(),
         }
     }
 }
@@ -117,7 +170,9 @@ struct RawRedis {
 #[derive(Debug, Deserialize)]
 struct RawAgent {
     service: String,
-    allowed_upstreams: StringList,
+    /// 服务名 → 真实 base URL 的映射。缺省为空(将拒绝启动)。
+    #[serde(default)]
+    upstreams: UpstreamSpec,
     max_concurrency: usize,
     /// Redis key 前缀。缺省 / 留空回退到 `bridge`(见 Keyspace)。
     #[serde(default)]
@@ -127,7 +182,7 @@ struct RawAgent {
 struct AgentConfig {
     redis_url: String,
     service: String,
-    allowed: Vec<Url>,
+    upstreams: HashMap<String, Upstream>,
     max_concurrency: usize,
     key_prefix: String,
 }
@@ -156,57 +211,109 @@ fn load_config() -> Result<AgentConfig, AgentError> {
         .try_deserialize()
         .context(ConfigSnafu)?;
 
-    // 允许清单必须逐条校验:只接受 http(s),且不能为空 —— 空清单等于开放代理
-    let mut allowed = Vec::new();
-    for entry in agent.allowed_upstreams.into_vec() {
-        let url = entry
-            .parse::<Url>()
-            .context(AllowedUpstreamSnafu { url: entry.clone() })?;
+    // upstreams 逐条校验:只接受 http(s) 的 base URL,header 名/值也在此解析,
+    // typo / 非法值启动即失败;空映射拒绝启动(几乎必是配置漏了)。
+    let mut upstreams = HashMap::new();
+    for (service, entry) in agent.upstreams.into_map() {
+        let (target, raw_headers) = match entry {
+            UpstreamEntry::Bare(base) => (base, HashMap::new()),
+            UpstreamEntry::Full { base, headers } => (base, headers),
+        };
+        let mut url = target.parse::<Url>().context(InvalidUpstreamSnafu {
+            service: service.clone(),
+            url: target.clone(),
+        })?;
         ensure!(
             matches!(url.scheme(), "http" | "https"),
-            NonHttpUpstreamSnafu { url: entry }
+            NonHttpUpstreamSnafu {
+                service: service.clone(),
+                url: target.clone(),
+            }
         );
-        allowed.push(url);
+        // base 只应是 scheme+host+port[+basepath];query/fragment 无意义,清掉,
+        // 免得后面按字符串拼 path 时污染结果。
+        url.set_query(None);
+        url.set_fragment(None);
+
+        // 注入 header 在启动时就解析成 HeaderName/HeaderValue —— 非法配置立即报错,
+        // 每请求只剩 clone。value 标记 sensitive(常是凭证):不进 Debug、h2 不索引。
+        let mut headers = Vec::with_capacity(raw_headers.len());
+        for (name, value) in raw_headers {
+            let header_name =
+                HeaderName::from_bytes(name.as_bytes()).context(InvalidHeaderNameSnafu {
+                    service: service.clone(),
+                    name: name.clone(),
+                })?;
+            let mut header_value =
+                HeaderValue::from_str(&value).context(InvalidHeaderValueSnafu {
+                    service: service.clone(),
+                    name: name.clone(),
+                })?;
+            header_value.set_sensitive(true);
+            headers.push((header_name, header_value));
+        }
+
+        upstreams.insert(service, Upstream { base: url, headers });
     }
-    ensure!(!allowed.is_empty(), EmptyAllowListSnafu);
+    ensure!(!upstreams.is_empty(), EmptyUpstreamsSnafu);
     ensure!(agent.max_concurrency > 0, ZeroConcurrencySnafu);
 
     Ok(AgentConfig {
         redis_url: redis.uri,
         service: agent.service,
-        allowed,
+        upstreams,
         max_concurrency: agent.max_concurrency,
         key_prefix: agent.key_prefix,
     })
 }
 
-/// 目标 URL 是否落在允许清单内。
+/// 把逻辑地址(`https://{服务名}/path?query`)解析成真实上游:定位服务配置并拼出目标 URL。
+/// 返回 `(&Upstream, 目标 URL)` —— 调用方据此拿到该服务要注入的 header。
 ///
-/// 匹配规则:
-/// 1. **origin(scheme + host + port)必须完全相同** —— 这是硬边界。任何
-///    主机名、端口或协议的差异都会被拒绝,`file:`/`data:` 这类不透明 origin
-///    也因此天然不匹配。
-/// 2. 清单项若带路径,则目标路径必须落在它的子树内,且按**路径段边界**比较,
-///    以免 `/api` 意外放行 `/apifoo`。清单项路径为空或 `/` 时不做路径限制。
+/// 服务名取自 URL 的 host 段,查 `upstreams` 得到真实 base URL(scheme+host+port,
+/// 可带 base path);最终地址 = base + 请求 path + 请求 query,scheme/host/port 全部
+/// 来自配置,调用方碰不到。服务名不在映射内返回 `UnknownUpstream`。
 ///
-/// `Url::parse` 会规范化 `.` 与 `..`,所以普通的路径穿越进不来;但百分号编码的
-/// `%2e` / `%2f` 不会被解码,上游服务器却可能解码它们,因此在有路径限制时直接
-/// 拒绝含这两者的路径。origin 才是可靠的边界,路径限制属于纵深防御。
-fn is_allowed(target: &Url, allowed: &[Url]) -> bool {
-    allowed.iter().any(|entry| {
-        if entry.origin() != target.origin() {
-            return false;
+/// 安全性:调用方只能选服务名 + 路径,真实 host 完全由配置决定,天然无法指向任意
+/// 内网地址 —— 这是比「白名单校验调用方给的真实 URL」更强的边界。若 base 带 path
+/// (子树限制),额外拒绝含 `%2e`/`%2f` 的请求路径,防止上游解码后穿越出该子树。
+fn resolve_upstream<'a>(
+    upstreams: &'a HashMap<String, Upstream>,
+    logical: &Url,
+) -> Result<(&'a Upstream, Url), BridgeError> {
+    let service = logical.host_str().ok_or_else(|| BridgeError::Internal {
+        detail: format!("logical url has no service name: {logical}"),
+    })?;
+    let upstream = upstreams
+        .get(service)
+        .ok_or_else(|| BridgeError::UnknownUpstream {
+            service: service.to_string(),
+        })?;
+    let base = &upstream.base;
+
+    let base_path = base.path().trim_end_matches('/'); // "" 或 "/api"
+    let req_path = logical.path(); // 解析后的路径,总以 "/" 开头
+    if !base_path.is_empty() {
+        let lower = req_path.to_ascii_lowercase();
+        if lower.contains("%2e") || lower.contains("%2f") {
+            return Err(BridgeError::Internal {
+                detail: format!("encoded path traversal rejected: {req_path}"),
+            });
         }
-        let base = entry.path().trim_end_matches('/');
-        if base.is_empty() {
-            return true;
-        }
-        let path = target.path();
-        if path.to_ascii_lowercase().contains("%2e") || path.to_ascii_lowercase().contains("%2f") {
-            return false;
-        }
-        path == base || path.starts_with(&format!("{base}/"))
-    })
+    }
+
+    // 字符串拼接再 parse:避免 set_path 对已编码的 %XX 二次编码。base 已在
+    // load_config 清掉 query/fragment,as_str() 就是纯 scheme://host[:port][/basepath]。
+    let base_str = base.as_str().trim_end_matches('/');
+    let mut full = format!("{base_str}{req_path}");
+    if let Some(query) = logical.query() {
+        full.push('?');
+        full.push_str(query);
+    }
+    let target = full.parse::<Url>().map_err(|e| BridgeError::Internal {
+        detail: format!("failed to build target url {full:?}: {e}"),
+    })?;
+    Ok((upstream, target))
 }
 
 #[tokio::main]
@@ -240,7 +347,7 @@ async fn run() -> Result<(), AgentError> {
     let agent = Arc::new(Agent {
         redis,
         http,
-        allowed: cfg.allowed,
+        upstreams: cfg.upstreams,
         sem: Arc::new(Semaphore::new(cfg.max_concurrency)),
         service: cfg.service,
         keyspace,
@@ -262,7 +369,8 @@ async fn run() -> Result<(), AgentError> {
     tracing::info!(
         service = %agent.service,
         redis_cluster = agent.redis.is_cluster(),
-        allowed_upstreams = %agent.allowed.iter().map(Url::as_str).collect::<Vec<_>>().join(", "),
+        // 只列服务名;真实上游地址是 B 侧内部信息,operator 需要时看配置即可
+        upstreams = %agent.upstreams.keys().cloned().collect::<Vec<_>>().join(", "),
         max_concurrency = agent.max_concurrency,
         "bridge agent started"
     );
@@ -413,7 +521,8 @@ async fn handle_one(agent: Arc<Agent>, raw: Vec<u8>, _permit: OwnedSemaphorePerm
 
 /// 转发到目标上游,返回 Result 语义的结果。
 ///
-/// 目标地址来自请求,但必须先通过 `is_allowed` 的清单校验。
+/// 请求给的是逻辑地址(`https://{服务名}/...`),真实地址先由 `resolve_upstream`
+/// 按配置解析出来;未知服务在发出任何网络请求之前就被拒绝。
 async fn forward(agent: &Agent, req: &HttpRequest) -> Result<HttpOk, BridgeError> {
     // deadline 先检查:A 已超时离开就不打本地服务,避免无意义负载与重复副作用
     let now = unix_ms_now();
@@ -434,41 +543,25 @@ async fn forward(agent: &Agent, req: &HttpRequest) -> Result<HttpOk, BridgeError
             detail: format!("invalid method {:?}: {e}", req.method),
         }
     })?;
-    // 必须解析为绝对 URL:Url::parse 不接受相对引用,因此不存在「拼到 base 上」
-    // 的余地,目标地址完全显式。
-    let url = req.url.parse::<Url>().map_err(|e| BridgeError::Internal {
+    // 逻辑地址:host 是服务名,真实地址由 upstreams 配置解析。解析(含未知服务的
+    // 拒绝)发生在任何网络请求之前 —— 调用方碰不到真实 host。
+    let logical = req.url.parse::<Url>().map_err(|e| BridgeError::Internal {
         detail: format!("invalid url {:?}: {e}", req.url),
     })?;
-    // 安全边界:清单之外一律拒绝,且在发出任何网络请求之前就拒绝
-    if !is_allowed(&url, &agent.allowed) {
-        tracing::warn!(%url, req_id = %req.req_id, "rejected: upstream not in allow list");
-        return Err(BridgeError::UpstreamNotAllowed {
-            url: url.to_string(),
-        });
-    }
-
-    let mut headers = HeaderMap::new();
-    for (name, value) in &req.headers {
-        // hop-by-hop 不透传;accept-encoding 也剥掉 —— 交给 reqwest 自己协商并透明
-        // 解压。若把调用方带来的 accept-encoding 透传过去,reqwest 会认为调用方要
-        // 自行处理压缩而**不再解压**,body 就成了压缩流,协议层只能 base64 兜住,
-        // 既不可读也违背这次「文本直存」的目的。
-        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("accept-encoding") {
-            continue;
+    let (upstream, target) = match resolve_upstream(&agent.upstreams, &logical) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(url = %req.url, req_id = %req.req_id, error = %e, "rejected: upstream not resolved");
+            return Err(e);
         }
-        let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) else {
-            tracing::debug!(header = %name, "dropping invalid header");
-            continue;
-        };
-        headers.append(n, v);
-    }
+    };
+
+    // 调用方 header 先铺,再用该服务配置的注入 header 覆盖同名(config wins)。
+    let headers = build_forward_headers(&req.headers, &upstream.headers);
 
     let resp = agent
         .http
-        .request(method, url)
+        .request(method, target)
         .headers(headers)
         .body(req.body.clone())
         .timeout(remaining)
@@ -515,6 +608,37 @@ fn map_reqwest_err(e: reqwest::Error) -> BridgeError {
             detail: e.to_string(),
         }
     }
+}
+
+/// 构造转发用的 `HeaderMap`:先铺调用方 header(剔 hop-by-hop 与 `accept-encoding` ——
+/// 后者交给 reqwest 自行协商并透明解压,详见调用处),再用该服务配置的注入 header
+/// **覆盖同名**(config wins,用 `insert` 替换掉调用方的全部同名值)。这样凭证之类可由
+/// agent 配置强制注入,调用方既顶不掉也剥不掉。
+fn build_forward_headers(
+    caller: &[(String, String)],
+    injected: &[(HeaderName, HeaderValue)],
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in caller {
+        // accept-encoding 剥掉:若透传,reqwest 会认为调用方要自行处理压缩而**不再解压**,
+        // body 就成了压缩流,协议层只能 base64 兜住,既不可读也违背「文本直存」的目的。
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) else {
+            tracing::debug!(header = %name, "dropping invalid header");
+            continue;
+        };
+        headers.append(n, v);
+    }
+    // insert(非 append):替换调用方的全部同名值,保证注入值是该 header 的唯一值。
+    for (name, value) in injected {
+        headers.insert(name, value.clone());
+    }
+    headers
 }
 
 /// 回写响应。两种投递方式都带 TTL,保证 A 侧崩溃/不来取时 Redis 不会永久残留:
@@ -600,87 +724,166 @@ fn unix_ms_now() -> u64 {
 mod tests {
     use super::*;
 
-    fn allow(entries: &[&str]) -> Vec<Url> {
-        entries.iter().map(|e| e.parse().unwrap()).collect()
+    fn upstreams(pairs: &[(&str, &str)]) -> HashMap<String, Upstream> {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Upstream {
+                        base: v.parse().unwrap(),
+                        headers: Vec::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
-    fn allowed(list: &[&str], target: &str) -> bool {
-        is_allowed(&target.parse().unwrap(), &allow(list))
+    fn resolve(pairs: &[(&str, &str)], logical: &str) -> Result<String, BridgeError> {
+        resolve_upstream(&upstreams(pairs), &logical.parse().unwrap())
+            .map(|(_, target)| target.to_string())
     }
 
+    /// 已知服务名解析到配置的真实 base,path 原样带过去。
     #[test]
-    fn same_origin_passes() {
-        let list = ["http://127.0.0.1:8080"];
-        assert!(allowed(&list, "http://127.0.0.1:8080/"));
-        assert!(allowed(&list, "http://127.0.0.1:8080/api/orders?page=1"));
-    }
-
-    /// origin 的任一部分不同都必须拒绝,这是硬边界。
-    #[test]
-    fn different_origin_rejected() {
-        let list = ["http://127.0.0.1:8080"];
-        assert!(!allowed(&list, "http://127.0.0.1:8081/"), "端口不同");
-        assert!(!allowed(&list, "http://127.0.0.2:8080/"), "主机不同");
-        assert!(!allowed(&list, "https://127.0.0.1:8080/"), "协议不同");
-        assert!(!allowed(&list, "http://evil.example/"), "完全无关的主机");
-        assert!(
-            !allowed(&list, "http://169.254.169.254/latest/meta-data/"),
-            "云元数据服务必须拒绝"
+    fn known_service_resolves_to_real_base() {
+        let up = [("grok", "http://10.0.0.5:7257")];
+        assert_eq!(
+            resolve(&up, "https://grok/v1/chat/completions").unwrap(),
+            "http://10.0.0.5:7257/v1/chat/completions"
         );
     }
 
-    /// 非 http(s) 的 scheme 产生不透明 origin,永远匹配不上。
+    /// query 原样保留。
     #[test]
-    fn non_http_schemes_rejected() {
-        let list = ["http://127.0.0.1:8080"];
-        assert!(!allowed(&list, "file:///etc/passwd"));
-        assert!(!allowed(&list, "data:text/plain,hi"));
-    }
-
-    #[test]
-    fn multiple_entries() {
-        let list = ["http://127.0.0.1:8080", "http://127.0.0.1:9090"];
-        assert!(allowed(&list, "http://127.0.0.1:8080/a"));
-        assert!(allowed(&list, "http://127.0.0.1:9090/b"));
-        assert!(!allowed(&list, "http://127.0.0.1:7070/c"));
-    }
-
-    /// 清单项带路径时限制在子树内,且必须按段边界比较。
-    #[test]
-    fn path_scoping() {
-        let list = ["http://127.0.0.1:8080/api"];
-        assert!(allowed(&list, "http://127.0.0.1:8080/api"));
-        assert!(allowed(&list, "http://127.0.0.1:8080/api/orders"));
-        assert!(!allowed(&list, "http://127.0.0.1:8080/admin"));
-        assert!(
-            !allowed(&list, "http://127.0.0.1:8080/apifoo"),
-            "/api 不能放行 /apifoo"
+    fn query_is_preserved() {
+        let up = [("grok", "http://10.0.0.5:7257")];
+        assert_eq!(
+            resolve(&up, "https://grok/v1?a=1&b=2").unwrap(),
+            "http://10.0.0.5:7257/v1?a=1&b=2"
         );
     }
 
-    /// Url::parse 会规范化 `..`,所以穿越后落在清单外就会被拒。
+    /// 调用方的 scheme / 端口只是占位,真实地址完全来自配置 —— 碰不到真实 host。
     #[test]
-    fn dot_segments_are_normalized_then_checked() {
-        let list = ["http://127.0.0.1:8080/api"];
-        let u: Url = "http://127.0.0.1:8080/api/../admin".parse().unwrap();
-        assert_eq!(u.path(), "/admin", "解析阶段已规范化");
-        assert!(!is_allowed(&u, &allow(&list)));
+    fn caller_scheme_and_port_are_ignored() {
+        let up = [("grok", "https://10.0.0.5:7257")];
+        assert_eq!(
+            resolve(&up, "http://grok:9999/x").unwrap(),
+            "https://10.0.0.5:7257/x"
+        );
     }
 
-    /// 百分号编码的 `.` `/` 不会被 Url 解码,但上游可能解码,因此有路径限制时直接拒绝。
+    /// base 带 path 时作为前缀,子树天然受限。
     #[test]
-    fn percent_encoded_traversal_rejected() {
-        let list = ["http://127.0.0.1:8080/api"];
-        assert!(!allowed(&list, "http://127.0.0.1:8080/api/%2e%2e/admin"));
-        assert!(!allowed(&list, "http://127.0.0.1:8080/api/%2E%2E/admin"));
-        assert!(!allowed(&list, "http://127.0.0.1:8080/api/x%2fy"));
+    fn base_path_is_prefixed() {
+        let up = [("api", "http://127.0.0.1:8080/api")];
+        assert_eq!(
+            resolve(&up, "https://api/orders").unwrap(),
+            "http://127.0.0.1:8080/api/orders"
+        );
+        assert_eq!(
+            resolve(&up, "https://api/").unwrap(),
+            "http://127.0.0.1:8080/api/"
+        );
     }
 
-    /// 清单项只有 origin(路径为空或 /)时不做路径限制,编码字符也不该误伤。
+    /// 服务名不在映射内 → UnknownUpstream,且不暴露任何真实地址。
     #[test]
-    fn origin_only_entry_allows_any_path() {
-        let list = ["http://127.0.0.1:8080/"];
-        assert!(allowed(&list, "http://127.0.0.1:8080/anything/at/all"));
-        assert!(allowed(&list, "http://127.0.0.1:8080/items/a%20b"));
+    fn unknown_service_is_rejected() {
+        let up = [("grok", "http://10.0.0.5:7257")];
+        let err = resolve(&up, "https://nope/x").unwrap_err();
+        assert!(matches!(err, BridgeError::UnknownUpstream { service } if service == "nope"));
+    }
+
+    /// base 带 path 时拒绝编码穿越;base 无 path(整个 host 可达)则不误伤编码字符。
+    #[test]
+    fn encoded_traversal_rejected_only_under_base_path() {
+        let with_path = [("api", "http://127.0.0.1:8080/api")];
+        assert!(resolve(&with_path, "https://api/x%2e%2e/y").is_err());
+        assert!(resolve(&with_path, "https://api/a%2fb").is_err());
+
+        let no_path = [("h", "http://127.0.0.1:8080")];
+        assert!(resolve(&no_path, "https://h/items/a%20b").is_ok());
+    }
+
+    /// Url::parse 规范化 `..`,穿越也只会落在配置 host 内,越不出去。
+    #[test]
+    fn dot_segments_normalized_by_url_parse() {
+        let up = [("grok", "http://10.0.0.5:7257")];
+        assert_eq!(
+            resolve(&up, "https://grok/../admin").unwrap(),
+            "http://10.0.0.5:7257/admin"
+        );
+    }
+
+    /// CSV 写法(环境变量简写)解析成一组 `Bare` 条目(不带注入 header)。
+    #[test]
+    fn upstream_spec_csv_parses() {
+        let spec = UpstreamSpec::Csv(
+            "grok=http://10.0.0.5:7257, api=http://127.0.0.1:8080/api".to_string(),
+        );
+        let map = spec.into_map();
+        assert!(matches!(map.get("grok"), Some(UpstreamEntry::Bare(u)) if u == "http://10.0.0.5:7257"));
+        assert!(matches!(map.get("api"), Some(UpstreamEntry::Bare(u)) if u == "http://127.0.0.1:8080/api"));
+    }
+
+    /// `Map` 里裸字符串走 `Bare`、带 base+headers 的表走 `Full`,into_map 原样透传。
+    #[test]
+    fn upstream_spec_map_keeps_full_entries() {
+        let mut m = HashMap::new();
+        m.insert(
+            "grok".to_string(),
+            UpstreamEntry::Bare("http://10.0.0.5:7257".to_string()),
+        );
+        m.insert(
+            "api".to_string(),
+            UpstreamEntry::Full {
+                base: "http://127.0.0.1:8080/api".to_string(),
+                headers: HashMap::from([("authorization".to_string(), "Bearer x".to_string())]),
+            },
+        );
+        let out = UpstreamSpec::Map(m).into_map();
+        assert!(matches!(out.get("grok"), Some(UpstreamEntry::Bare(_))));
+        match out.get("api") {
+            Some(UpstreamEntry::Full { base, headers }) => {
+                assert_eq!(base, "http://127.0.0.1:8080/api");
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer x");
+            }
+            other => panic!("expected Full entry, got {other:?}"),
+        }
+    }
+
+    /// 配置注入的 header 覆盖调用方同名(config wins);其余调用方 header 保留,
+    /// accept-encoding 仍被剥掉。
+    #[test]
+    fn injected_headers_override_caller() {
+        let injected = vec![(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer real"),
+        )];
+        let caller = vec![
+            ("authorization".to_string(), "Bearer fake".to_string()),
+            ("x-keep".to_string(), "1".to_string()),
+            ("accept-encoding".to_string(), "gzip".to_string()),
+        ];
+        let headers = build_forward_headers(&caller, &injected);
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer real"
+        );
+        assert_eq!(headers.get("x-keep").unwrap().to_str().unwrap(), "1");
+        assert!(headers.get("accept-encoding").is_none());
+    }
+
+    /// 调用方没给的注入 header 直接加上。
+    #[test]
+    fn injected_headers_added_when_absent() {
+        let injected = vec![(
+            HeaderName::from_static("x-source"),
+            HeaderValue::from_static("ferry"),
+        )];
+        let headers = build_forward_headers(&[], &injected);
+        assert_eq!(headers.get("x-source").unwrap().to_str().unwrap(), "ferry");
     }
 }

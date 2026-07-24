@@ -33,7 +33,7 @@
   "reply_to": "9ec3e780ba7c4745a1bd27702e0b44d9",
   "reply_mode": "queue",
   "method": "POST",
-  "url": "http://10.0.0.5:8080/api/orders?page=1",
+  "url": "https://orders/api/orders?page=1",
   "headers": [["content-type", "application/json"], ["x-from", "go"]],
   "body_encoding": "utf8",
   "body": "{\"ping\":true}",
@@ -45,15 +45,18 @@
   `queue`,兼容不认识该字段的旧调用方。
 - `reply_to`:**仅 `queue` 模式用**,填发送方自己的 `instance_id`,B 侧据此拼出
   `bridge:resp:{reply_to}`。`kv` 模式忽略它(响应按 `req_id` 寻址),填 `""` 即可。
-- `url` 必须是**完整的绝对 URL**,不是路径。目标地址由调用方给出,但 agent 会拿它
-  比对自己配置的 `ALLOWED_UPSTREAMS` 清单,不在清单内一律返回
-  `UpstreamNotAllowed` 且**不会发出任何网络请求**。决定权始终在 B 侧 —— 否则任何
-  能往队列 LPUSH 的人都能让 agent 访问 B 内网的任意地址(内部后台、数据库、
-  云元数据服务 `169.254.169.254` 等)。
-- 匹配规则:origin(scheme + host + port)必须完全一致;清单项若带路径,则目标
-  路径须落在其子树内。agent 同时**禁用了自动重定向**,上游返回的 3xx 原样回传给
-  调用方,不会被 agent 跟随 —— 否则一个指向内网的 302 就能绕过清单。
+- `url` 是**逻辑地址** `https://{服务名}/path?query`:host 段是**服务名**而非真实主机,
+  scheme 只是占位、被忽略。agent 拿服务名查自己配置的 `upstreams` 映射得到真实 base URL
+  (scheme+host+port,可带 base path),再拼上请求的 path/query 去调用;真实地址完全
+  来自配置,调用方碰不到。服务名不在映射内一律返回 `UnknownUpstream` 且**不会发出任何
+  网络请求**。这样 Redis 里只出现服务名,真实上游地址不外泄,调用方也无法把 agent 指向
+  任意内网地址(内部后台、数据库、云元数据服务 `169.254.169.254` 等)。
+- 最终地址 = 配置的 base URL + 请求的 path/query。agent 同时**禁用了自动重定向**,上游
+  返回的 3xx 原样回传给调用方,不会被 agent 跟随 —— 否则一个指向内网的 302 就能绕过边界。
+  若 base URL 带 path(子树限制),额外拒绝含 `%2e`/`%2f` 编码穿越的请求路径。
 - `headers` 是二元数组的数组,不是 object —— 同名 header 可以重复出现,object 表达不了。
+  注意 agent 可为某个服务配置**注入 header**,它会**覆盖你发的同名 header**(常用于由 B 侧
+  统一注入 `Authorization` 等凭证,免得密钥进 Redis);这类 header 不必、也不应由调用方再发。
 - **body 按内容选编码**,与响应同规则,靠同级的 `body_encoding` 区分:
   - `utf8` —— body 是合法 UTF-8(JSON、文本),字段里就是**原文**。手工往队列塞请求时
     直接写 JSON 原文即可(注意它作为外层 JSON 的字符串值,内部引号仍需转义,用
@@ -117,7 +120,7 @@
 | `type` | 附加字段 | 含义 |
 |---|---|---|
 | `UpstreamUnreachable` | `detail: string` | B 连不上目标服务 |
-| `UpstreamNotAllowed` | `url: string` | 目标地址不在 agent 的允许清单内(安全边界,非故障) |
+| `UnknownUpstream` | `service: string` | 服务名不在 agent 的 upstreams 映射内(安全边界,非故障) |
 | `UpstreamTimeout` | — | 本地服务在 deadline 内没返回 |
 | `Expired` | — | 拉取到时已超过 deadline |
 | `TooLarge` | `limit: number` | body 超出大小限制 |
@@ -185,10 +188,10 @@ type Ok struct {
 }
 
 type BridgeError struct {
-	Type   string `json:"type"`
-	Detail string `json:"detail,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
-	URL    string `json:"url,omitempty"` // UpstreamNotAllowed 时给出被拒的地址
+	Type    string `json:"type"`
+	Detail  string `json:"detail,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	Service string `json:"service,omitempty"` // UnknownUpstream 时给出被拒的服务名
 }
 ```
 

@@ -1,8 +1,8 @@
 //! 演示:通过 Redis 桥向 B 侧服务发起一次 GET。
 //!
-//! 用法:
+//! 用法(url 是逻辑地址 https://{服务名}/path,服务名须在 agent 的 upstreams 里):
 //!   REDIS_URL=redis://127.0.0.1:6379 BRIDGE_SERVICE=demo \
-//!     cargo run -p bridge-client --example demo -- /api/foo
+//!     cargo run -p bridge-client --example demo -- https://demo/api/foo
 
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ async fn run() -> Result<(), Whatever> {
     let service = std::env::var("BRIDGE_SERVICE").unwrap_or_else(|_| "demo".into());
     let url = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:8080/".into());
+        .unwrap_or_else(|| "https://demo/".into());
 
     let client = BridgeClient::start(Config::new(redis_url, service))
         .await
