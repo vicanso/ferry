@@ -17,13 +17,16 @@ WORKDIR /build
 # 缓存,不必重新编译几百个依赖 —— 这是多阶段构建在 Rust 上最主要的收益。
 COPY Cargo.toml Cargo.lock ./
 COPY crates/protocol/Cargo.toml crates/protocol/
+COPY crates/redis/Cargo.toml    crates/redis/
 COPY crates/client/Cargo.toml   crates/client/
 COPY crates/agent/Cargo.toml    crates/agent/
 
-# workspace 的每个成员都必须有源码文件,cargo 才肯解析清单,先放空壳。
-# client 虽然不参与 -p bridge-agent 的构建,但缺了它 workspace 解析会失败。
-RUN mkdir -p crates/protocol/src crates/client/src crates/agent/src \
+# workspace 的每个成员都必须有源码文件,cargo 才肯解析整个 workspace,先放空壳 ——
+# 少任何一个成员(即便只 -p bridge-agent、client 不参与构建)解析都会失败。
+# agent 依赖 protocol 和 redis,它们的空壳 lib 也一并放上。
+RUN mkdir -p crates/protocol/src crates/redis/src crates/client/src crates/agent/src \
     && : > crates/protocol/src/lib.rs \
+    && : > crates/redis/src/lib.rs \
     && : > crates/client/src/lib.rs \
     && echo 'fn main() {}' > crates/agent/src/main.rs \
     && cargo build --release --locked -p bridge-agent
