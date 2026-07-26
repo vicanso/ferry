@@ -45,12 +45,15 @@ cargo run -p bridge-agent
 
 容器里通常什么都不挂,纯环境变量即可;需要复杂配置时再挂文件。
 
-| 配置项 | 环境变量 | 说明 |
-|---|---|---|
-| `redis.uri` | `FERRY__REDIS__URI` | 支持聚合写法,密码只写一次 |
-| `agent.service` | `FERRY__AGENT__SERVICE` | 消费哪个服务的队列 |
-| `agent.upstreams` | `FERRY__AGENT__UPSTREAMS` | 服务名 → 真实上游(base URL,可选注入 header),**留空拒绝启动** |
-| `agent.max_concurrency` | `FERRY__AGENT__MAX_CONCURRENCY` | 在途请求上限 |
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `redis.uri` | `FERRY__REDIS__URI` | `redis://127.0.0.1:6379` | 支持聚合写法,密码只写一次 |
+| `agent.service` | `FERRY__AGENT__SERVICE` | `demo` | 消费哪个服务的队列 |
+| `agent.key_prefix` | `FERRY__AGENT__KEY_PREFIX` | `bridge` | Redis key 前缀,**须与 A 侧一致** |
+| `agent.upstreams` | `FERRY__AGENT__UPSTREAMS` | *(空,拒绝启动)* | 服务名 → 真实上游(base URL,可选注入 header) |
+| `agent.max_concurrency` | `FERRY__AGENT__MAX_CONCURRENCY` | `64` | 在途请求上限 |
+| `agent.brpop_timeout_secs` | `FERRY__AGENT__BRPOP_TIMEOUT_SECS` | **`2`** | 请求队列 BRPOP 最长阻塞秒数(≥1)。调大可降低空闲 Redis 命令数,代价是关闭/断线感知变慢 |
+| `agent.metrics_interval_secs` | `FERRY__AGENT__METRICS_INTERVAL_SECS` | **`30`** | 指标 `LLEN` 间隔秒数;`0` 关闭 metrics 循环 |
 
 调用方只在消息里写**逻辑地址** `https://{服务名}/path`,服务名对应的真实 host 由
 `agent.upstreams` 指定 —— 这样 Redis 里只出现服务名,真实上游地址不外泄,调用方也无法
@@ -97,7 +100,11 @@ k8s 用 `terminationGracePeriodSeconds`;时间不够会在排空途中被 SIGKIL
 A 侧:
 
 ```rust
-let client = BridgeClient::start(Config::new("redis://127.0.0.1:6379", "demo")).await?;
+let client = BridgeClient::start(
+    Config::new("redis://127.0.0.1:6379", "demo")
+        // 可选:回复队列 BRPOP 超时,默认 2s;省 Upstash 等免费命令额度时可调大
+        // .with_brpop_timeout(Duration::from_secs(30))
+).await?;
 let resp = client.call(CallRequest {
     method: "GET".into(),
     // 逻辑地址:host 是服务名 grok,真实 host 由 agent 的 upstreams 配置决定
@@ -107,6 +114,40 @@ let resp = client.call(CallRequest {
     timeout: Duration::from_secs(10),
 }).await?;
 ```
+
+A 侧 `Config` 字段与默认值:
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `redis_url` | *(必填)* | Redis URI |
+| `service` | *(必填)* | 目标服务名 |
+| `key_prefix` | `bridge` | 须与 agent 一致;`Config::with_key_prefix` |
+| `brpop_timeout` | **`2s`** (`DEFAULT_BRPOP_TIMEOUT`) | 回复队列 BRPOP 阻塞时长;≥1s;`Config::with_brpop_timeout` |
+
+### 降低云 Redis 空闲命令数(可接受更高延迟)
+
+空闲时 agent 的 pull 循环和 client 的 `reply_loop` 仍会周期性发 `BRPOP`(超时返回 nil
+也计一次命令)。**默认每 2 秒一次**。若业务不要求实时、可接受更高延迟,两端一起调大:
+
+```bash
+# agent:BRPOP 30s 一次;metrics 5 分钟一次(或 0 关掉)
+FERRY__AGENT__BRPOP_TIMEOUT_SECS=30 \
+FERRY__AGENT__METRICS_INTERVAL_SECS=300 \
+FERRY__REDIS__URI=... FERRY__AGENT__SERVICE=demo \
+FERRY__AGENT__UPSTREAMS=grok=http://127.0.0.1:8080 \
+cargo run -p bridge-agent
+```
+
+```rust
+// client:与 agent 独立配置,但建议同量级,否则省命令效果不对齐
+BridgeClient::start(
+    Config::new(redis_url, service)
+        .with_brpop_timeout(Duration::from_secs(30)),
+).await?;
+```
+
+粗算:BRPOP 从 2s → 30s,单进程空闲命令数约降 **15 倍**。单次有消息时的路径仍是
+`LPUSH`/`BRPOP`/`LPUSH+EXPIRE`,与该超时无关。
 
 两个可运行示例:
 
@@ -147,7 +188,7 @@ scheme/host/port 全部来自配置,调用方碰不到。这条边界决定了 f
 
 **BRPOP 一旦发出就不能取消。** 命令送达 Redis 后元素已从 list 弹出,此时丢弃 future
 等于把这条请求扔掉 —— 它既不在队列里也没人处理,调用方只能干等超时。所以关闭信号只在
-两次 BRPOP 之间检查,代价是关闭最多多等 `BRPOP_TIMEOUT_SECS`(2 秒)。
+两次 BRPOP 之间检查,代价是关闭最多多等 `brpop_timeout`(**默认 2 秒**,可配)。
 
 **回写用 pipeline 合并 `LPUSH` + `EXPIRE`。** `EXPIRE` 是防泄漏保险丝:A 实例崩溃后
 它的回复队列不会永远留在 Redis 里。
@@ -173,8 +214,9 @@ headers。body 的编码请求和响应**刻意不同**:
 
 ## 可观测性
 
-agent 每 30 秒输出一次 `backlog`(请求队列 `LLEN`,最重要的健康指标 —— 一涨就说明
-B 侧处理不过来或已挂掉)和 `in_flight`(semaphore 占用)。
+agent 按 `metrics_interval_secs`(**默认 30 秒**;`0` 关闭)输出一次 `backlog`(请求队列
+`LLEN`,最重要的健康指标 —— 一涨就说明 B 侧处理不过来或已挂掉)和 `in_flight`
+(semaphore 占用)。
 
 排查报文用 `scripts/ferry-dump.py`,它会自动把 body 解开 base64,二进制 body
 显示成十六进制预览并标注类型:

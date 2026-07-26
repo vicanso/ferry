@@ -22,11 +22,13 @@ use bridge_protocol::{
     ReplyMode, DEFAULT_KEY_PREFIX, MAX_BODY_SIZE,
 };
 
-/// BRPOP 的阻塞时长。由于 BRPOP 发出后不可取消,这个值同时是
-/// 「关闭 / 断线被感知」的延迟上限。
-/// BRPOP 的最长阻塞时长。BRPOP 发出后不可取消,所以它同时是「关闭 / 断线被感知」
-/// 的延迟上限;专用连接的 response timeout 也由它推导。
-const MAX_BLOCK: Duration = Duration::from_secs(2);
+/// `Config::brpop_timeout` 的默认值:2 秒。
+///
+/// 空闲时 client 的 `reply_loop` 大约每这么久向 Redis 发一次 BRPOP。
+/// 想省云 Redis 免费命令额度时可调大(见 [`Config::with_brpop_timeout`]);
+/// 代价是关闭 / 断线感知最慢多等这么久。
+pub const DEFAULT_BRPOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -41,14 +43,21 @@ pub struct Config {
     /// Redis key 前缀,默认 `bridge`。**必须与 agent 侧配置一致**,否则两端用不同
     /// 的 key、彼此看不到。留空回退默认。用 [`Config::with_key_prefix`] 覆盖。
     pub key_prefix: String,
+    /// 回复队列 `BRPOP` 的最长阻塞时长。**默认 [`DEFAULT_BRPOP_TIMEOUT`](2 秒)**。
+    ///
+    /// 由于 BRPOP 发出后不可取消,它同时是「关闭 / 断线被感知」的延迟上限;
+    /// 专用连接的 response timeout 也由它推导。必须 ≥ 1 秒(零时长会被拒绝)。
+    pub brpop_timeout: Duration,
 }
 
 impl Config {
+    /// 使用默认 `key_prefix = bridge`、`brpop_timeout = 2s`。
     pub fn new(redis_url: impl Into<String>, service: impl Into<String>) -> Self {
         Self {
             redis_url: redis_url.into(),
             service: service.into(),
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
+            brpop_timeout: DEFAULT_BRPOP_TIMEOUT,
         }
     }
 
@@ -56,6 +65,16 @@ impl Config {
     #[must_use]
     pub fn with_key_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.key_prefix = prefix.into();
+        self
+    }
+
+    /// 覆盖回复队列 BRPOP 阻塞时长(**默认 2 秒**)。
+    ///
+    /// 可接受更高延迟、想降低空闲 Redis 命令数时调大(例如 30s / 60s)。
+    /// 传入 `Duration::ZERO` 会在 [`BridgeClient::start`] 时报错。
+    #[must_use]
+    pub fn with_brpop_timeout(mut self, timeout: Duration) -> Self {
+        self.brpop_timeout = timeout;
         self
     }
 }
@@ -93,6 +112,10 @@ pub enum CallError {
     Command { source: redis::RedisError },
     #[snafu(display("client is shut down"))]
     Closed,
+    #[snafu(display(
+        "config.brpop_timeout must be >= 1s (got {timeout:?}); zero would block forever and hang graceful shutdown"
+    ))]
+    ZeroBrpopTimeout { timeout: Duration },
 }
 
 pub struct BridgeClient {
@@ -107,12 +130,20 @@ pub struct BridgeClient {
 impl BridgeClient {
     /// 建池、生成 instance_id、spawn 后台 reply_loop。
     pub async fn start(cfg: Config) -> Result<Self, CallError> {
+        ensure!(
+            cfg.brpop_timeout >= Duration::from_secs(1),
+            ZeroBrpopTimeoutSnafu {
+                timeout: cfg.brpop_timeout
+            }
+        );
+
         // 连接池、拓扑判定、超时全部由 tibba-cache 负责,这里不关心拓扑
         let redis = Arc::new(bridge_redis::connect(&cfg.redis_url).context(RedisSnafu)?);
         let keyspace = Keyspace::new(&cfg.key_prefix);
         tracing::info!(
             cluster = redis.is_cluster(),
             key_prefix = keyspace.prefix(),
+            brpop_timeout_secs = cfg.brpop_timeout.as_secs(),
             "redis connected"
         );
 
@@ -127,6 +158,7 @@ impl BridgeClient {
             keyspace.reply_queue(&instance_id),
             Arc::clone(&pending),
             shutdown.clone(),
+            cfg.brpop_timeout,
         ));
 
         Ok(Self {
@@ -219,23 +251,25 @@ impl Drop for PendingGuard<'_> {
 
 /// 后台单任务:一条专用连接,循环 BRPOP 本实例的回复队列并路由给等待者。
 /// 断线按指数退避自愈(design §5.5)。
+/// `max_block` 来自 [`Config::brpop_timeout`](默认 2s)。
 async fn reply_loop(
     redis_client: Arc<RedisClient>,
     queue: String,
     pending: Arc<DashMap<Uuid, oneshot::Sender<HttpResponse>>>,
     shutdown: CancellationToken,
+    max_block: Duration,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut brpop = redis::cmd("BRPOP");
     // 服务端超时与连接的 response timeout 同源,不会互相对不上
-    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(MAX_BLOCK));
+    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(max_block));
     'reconnect: loop {
         if shutdown.is_cancelled() {
             return;
         }
         let mut conn = tokio::select! {
             _ = shutdown.cancelled() => return,
-            c = redis_client.dedicated_blocking_conn(MAX_BLOCK) => match c {
+            c = redis_client.dedicated_blocking_conn(max_block) => match c {
                 // 不在这里重置 backoff:「连得上但命令一直失败」的故障(如 MOVED)
                 // 每次重连都成功,在此重置会让退避归零、退化成热循环。
                 Ok(c) => c,

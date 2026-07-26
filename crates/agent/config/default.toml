@@ -25,7 +25,21 @@ service = "demo"
 key_prefix = "bridge"
 
 # 同时在途的请求数上限,也是 semaphore 的许可总数
+# 默认: 64
 max_concurrency = 64
+
+# BRPOP 最长阻塞秒数(默认: 2)。
+# 空闲时 agent 大约每 brpop_timeout_secs 秒向 Redis 发一次 BRPOP(超时返回 nil 也计
+# 一次命令)。可接受更高延迟、想省云 Redis 免费命令额度时调大(如 30 / 60);
+# 代价是关闭信号 / 断线感知最慢多等这么久(BRPOP 发出后不可取消)。
+# 必须 ≥ 1;不要设 0(无限阻塞会导致优雅关闭挂死)。
+# 环境变量: FERRY__AGENT__BRPOP_TIMEOUT_SECS
+brpop_timeout_secs = 2
+
+# 指标轮询间隔秒数(默认: 30)。周期性对请求队列做 LLEN,输出 backlog / in_flight。
+# 设为 0 关闭 metrics 循环(不再发 LLEN)。想省命令时可调大或关掉。
+# 环境变量: FERRY__AGENT__METRICS_INTERVAL_SECS
+metrics_interval_secs = 30
 
 # 服务名 → 真实上游。调用方只写 https://{服务名}/path,真实 host(以及可选的注入
 # header)只在这里、不进 Redis;服务名不在表里就拒绝,**留空则拒绝启动**。

@@ -23,14 +23,22 @@ use bridge_protocol::{
     ReplyMode, MAX_BODY_SIZE, RESP_KV_TTL_SECS, RESP_TTL_SECS,
 };
 
-/// BRPOP 的最长阻塞时长。由于 BRPOP 发出后不可取消,这个值同时是
-/// 「关闭 / 断线被感知」的延迟上限。
-/// 它同时决定专用连接的 response timeout —— 由 tibba 依此推导,见
-/// `dedicated_blocking_conn`。
-const MAX_BLOCK: Duration = Duration::from_secs(2);
+/// `agent.brpop_timeout_secs` 的默认值(与 `config/default.toml` 一致)。
+const DEFAULT_BRPOP_TIMEOUT_SECS: u64 = 2;
+/// `agent.metrics_interval_secs` 的默认值(与 `config/default.toml` 一致)。
+/// `0` 表示关闭 metrics 循环。
+const DEFAULT_METRICS_INTERVAL_SECS: u64 = 30;
+
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-const METRICS_INTERVAL: Duration = Duration::from_secs(30);
+
+fn default_brpop_timeout_secs() -> u64 {
+    DEFAULT_BRPOP_TIMEOUT_SECS
+}
+
+fn default_metrics_interval_secs() -> u64 {
+    DEFAULT_METRICS_INTERVAL_SECS
+}
 
 #[derive(Debug, Snafu)]
 enum AgentError {
@@ -71,6 +79,10 @@ enum AgentError {
     HttpClient { detail: String },
     #[snafu(display("agent.max_concurrency must be greater than 0"))]
     ZeroConcurrency,
+    #[snafu(display(
+        "agent.brpop_timeout_secs must be >= 1 (got {secs}); 0 would block forever and hang graceful shutdown"
+    ))]
+    ZeroBrpopTimeout { secs: u64 },
     #[snafu(display("redis connection failed"))]
     Redis { source: bridge_redis::Error },
     /// 从 tibba-cache 借用连接失败(池耗尽、连接建立失败等)
@@ -93,6 +105,8 @@ struct Agent {
     /// Redis key 命名空间(前缀可配)。请求队列 / 回复都经它拼 key。
     keyspace: Keyspace,
     max_concurrency: usize,
+    /// BRPOP 最长阻塞时长(默认 2s)。同时决定专用连接的 response timeout。
+    brpop_timeout: Duration,
 }
 
 /// 一个上游服务的解析后配置。
@@ -177,6 +191,12 @@ struct RawAgent {
     /// Redis key 前缀。缺省 / 留空回退到 `bridge`(见 Keyspace)。
     #[serde(default)]
     key_prefix: String,
+    /// BRPOP 最长阻塞秒数。默认 [`DEFAULT_BRPOP_TIMEOUT_SECS`]。
+    #[serde(default = "default_brpop_timeout_secs")]
+    brpop_timeout_secs: u64,
+    /// metrics `LLEN` 间隔秒数。默认 [`DEFAULT_METRICS_INTERVAL_SECS`];`0` 关闭。
+    #[serde(default = "default_metrics_interval_secs")]
+    metrics_interval_secs: u64,
 }
 
 struct AgentConfig {
@@ -185,6 +205,9 @@ struct AgentConfig {
     upstreams: HashMap<String, Upstream>,
     max_concurrency: usize,
     key_prefix: String,
+    brpop_timeout: Duration,
+    /// `None` 表示不跑 metrics 循环。
+    metrics_interval: Option<Duration>,
 }
 
 /// 按「烘焙默认值 → 外部文件 → 环境变量」三层叠加加载配置。
@@ -257,6 +280,18 @@ fn load_config() -> Result<AgentConfig, AgentError> {
     }
     ensure!(!upstreams.is_empty(), EmptyUpstreamsSnafu);
     ensure!(agent.max_concurrency > 0, ZeroConcurrencySnafu);
+    ensure!(
+        agent.brpop_timeout_secs >= 1,
+        ZeroBrpopTimeoutSnafu {
+            secs: agent.brpop_timeout_secs
+        }
+    );
+
+    let metrics_interval = if agent.metrics_interval_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(agent.metrics_interval_secs))
+    };
 
     Ok(AgentConfig {
         redis_url: redis.uri,
@@ -264,6 +299,8 @@ fn load_config() -> Result<AgentConfig, AgentError> {
         upstreams,
         max_concurrency: agent.max_concurrency,
         key_prefix: agent.key_prefix,
+        brpop_timeout: Duration::from_secs(agent.brpop_timeout_secs),
+        metrics_interval,
     })
 }
 
@@ -352,6 +389,7 @@ async fn run() -> Result<(), AgentError> {
         service: cfg.service,
         keyspace,
         max_concurrency: cfg.max_concurrency,
+        brpop_timeout: cfg.brpop_timeout,
     });
 
     let shutdown = CancellationToken::new();
@@ -364,7 +402,15 @@ async fn run() -> Result<(), AgentError> {
         });
     }
 
-    tokio::spawn(metrics_loop(Arc::clone(&agent), shutdown.clone()));
+    if let Some(interval) = cfg.metrics_interval {
+        tokio::spawn(metrics_loop(
+            Arc::clone(&agent),
+            interval,
+            shutdown.clone(),
+        ));
+    } else {
+        tracing::info!("metrics loop disabled (agent.metrics_interval_secs = 0)");
+    }
 
     tracing::info!(
         service = %agent.service,
@@ -372,6 +418,8 @@ async fn run() -> Result<(), AgentError> {
         // 只列服务名;真实上游地址是 B 侧内部信息,operator 需要时看配置即可
         upstreams = %agent.upstreams.keys().cloned().collect::<Vec<_>>().join(", "),
         max_concurrency = agent.max_concurrency,
+        brpop_timeout_secs = agent.brpop_timeout.as_secs(),
+        metrics_interval_secs = cfg.metrics_interval.map(|d| d.as_secs()).unwrap_or(0),
         "bridge agent started"
     );
     pull_loop(agent, shutdown).await
@@ -408,13 +456,14 @@ async fn shutdown_signal() {
 /// 主循环:先拿许可 → BRPOP 一条 → spawn 处理。断线指数退避自愈。
 async fn pull_loop(agent: Arc<Agent>, shutdown: CancellationToken) -> Result<(), AgentError> {
     let queue = agent.keyspace.request_queue(&agent.service);
+    let max_block = agent.brpop_timeout;
     // BRPOP 是阻塞命令,用专用连接,不从连接池借
     let mut conn: Option<bridge_redis::RedisDedicatedConn> = None;
     let mut backoff = INITIAL_BACKOFF;
     let mut brpop = redis::cmd("BRPOP");
-    // 服务端超时由 tibba 的 helper 从 MAX_BLOCK 推导,和连接的 response timeout
+    // 服务端超时由 tibba 的 helper 从 max_block 推导,和连接的 response timeout
     // 出自同一个来源,不会再出现两者对不上导致每次都超时的情况
-    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(MAX_BLOCK));
+    brpop.arg(&queue).arg(bridge_redis::brpop_timeout_secs(max_block));
 
     'main: loop {
         // ① 先拿许可再拉取,顺序不能反:让请求积压在 Redis 队列里而不是本进程内存里
@@ -430,7 +479,7 @@ async fn pull_loop(agent: Arc<Agent>, shutdown: CancellationToken) -> Result<(),
                 break 'pull None;
             }
             if conn.is_none() {
-                match agent.redis.dedicated_blocking_conn(MAX_BLOCK).await {
+                match agent.redis.dedicated_blocking_conn(max_block).await {
                     // 这里**不能**重置 backoff。像 MOVED 这种「连得上但每条命令都
                     // 失败」的故障,重连总是成功的,在这里重置会让退避永远归零、
                     // 退化成热循环。只有命令真正成功才算恢复。
@@ -450,7 +499,7 @@ async fn pull_loop(agent: Arc<Agent>, shutdown: CancellationToken) -> Result<(),
             // 绝不能把这个 await 放进 tokio::select! 里取消:命令一旦发给 Redis,
             // 元素就已从 list 弹出,丢弃 future 等于把这条请求扔掉 —— 它既不在
             // 队列里也没人处理,调用方只能干等到超时。宁可让关闭最多多等
-            // BRPOP_TIMEOUT_SECS 秒。
+            // brpop_timeout 秒。
             let res: redis::RedisResult<Option<(String, Vec<u8>)>> = brpop.query_async(c).await;
             match res {
                 Ok(Some((_key, raw))) => {
@@ -684,9 +733,10 @@ async fn send_response(
 }
 
 /// 可观测性(design §5.4):周期性输出队列积压(最重要的健康指标)与 in-flight 并发。
-async fn metrics_loop(agent: Arc<Agent>, shutdown: CancellationToken) {
+/// `interval` 来自 `agent.metrics_interval_secs`(默认 30s);为 0 时不 spawn 本任务。
+async fn metrics_loop(agent: Arc<Agent>, interval: Duration, shutdown: CancellationToken) {
     let queue = agent.keyspace.request_queue(&agent.service);
-    let mut tick = tokio::time::interval(METRICS_INTERVAL);
+    let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
