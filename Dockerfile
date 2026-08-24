@@ -71,15 +71,8 @@ WORKDIR /home/app
 # 默认配置已烘焙进二进制(crates/agent/config/default.toml),容器里不必挂文件。
 # 环境变量前缀 FERRY,层级分隔符是双下划线,优先级高于所有 TOML 源。
 # 需要复杂配置时挂一个 TOML 进来并用 FERRY_CONFIG 指向它即可。
-#
-# upstreams 是「服务名 → 真实上游」的映射,调用方只给服务名,真实地址(及可选的注入
-# header)只在这里。无 header 用逗号分隔的整表简写(如下);要给某服务注入 header
-# (如统一下发 Authorization,免得密钥进 Redis)用嵌套写法:
-#   -e FERRY__AGENT__UPSTREAMS__GROK__BASE=http://... \
-#   -e FERRY__AGENT__UPSTREAMS__GROK__HEADERS__AUTHORIZATION='Bearer ...'
-# 留空会拒绝启动 —— 必须显式指定。这里给个占位默认,部署时按实际服务覆盖。
-ENV FERRY__AGENT__UPSTREAMS=demo=http://127.0.0.1:8080 \
-    RUST_LOG=info
+
+ENV RUST_LOG=info
 
 # agent 以 PID 1 运行并自行处理 SIGTERM:收到后停止拉取新请求,等 in-flight
 # 全部完成再退出。编排器的 grace period 要留够(docker stop 默认 10s,
