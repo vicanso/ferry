@@ -558,6 +558,16 @@ async fn handle_one(agent: Arc<Agent>, raw: Vec<u8>, _permit: OwnedSemaphorePerm
     };
 
     let req_id = req.req_id;
+    // 从 Redis 读到的调用原样记一行(debug):method + 逻辑 url + 调用方 header。
+    // 这些都是队列里已有的内容(redis-cli / ferry-dump 也看得到),记日志不构成
+    // 额外泄露。注入的凭证 header 是配置里的、不在 Redis,绝不在这里打其值(见 forward)。
+    tracing::debug!(
+        %req_id,
+        method = %req.method,
+        url = %req.url,
+        headers = ?req.headers,
+        "request read from redis"
+    );
     let result = forward(&agent, &req).await;
     if let Err(ref e) = result {
         tracing::debug!(%req_id, error = %e, "request failed");
@@ -605,6 +615,15 @@ async fn forward(agent: &Agent, req: &HttpRequest) -> Result<HttpOk, BridgeError
         }
     };
 
+    // 只记注入了哪些 header 名,绝不记其值:值是配置里的凭证,刻意不进 Redis,
+    // 也不该进日志 —— debug 排障时一旦被采集进中心化日志,泄露比进 Redis 更难收回。
+    if !upstream.headers.is_empty() {
+        tracing::debug!(
+            req_id = %req.req_id,
+            injected = ?upstream.headers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "injecting configured headers (values redacted)"
+        );
+    }
     // 调用方 header 先铺,再用该服务配置的注入 header 覆盖同名(config wins)。
     let headers = build_forward_headers(&req.headers, &upstream.headers);
 
