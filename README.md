@@ -22,9 +22,16 @@ A(调用方)                  Redis                    B(有 HTTP 服务)
 |---|---|---|
 | `bridge-protocol` | `crates/protocol` | 消息定义、JSON 编解码、key 约定、hop-by-hop 黑名单 |
 | `bridge-client` | `crates/client` | A 侧,对外暴露 `BridgeClient::call()` |
-| `bridge-agent` | `crates/agent` | B 侧二进制,拉取 → 转发本地 HTTP → 回写 |
+| `bridge-agent` | `crates/agent` | B 侧,拉取 → 转发本地 HTTP → 回写(库 + 独立 bin) |
+| `ferry-git` | `crates/git` | git 操作库:切分支 / fetch / pull / 取两个 commit 的 patch(库 + CLI) |
+| `ferry-git-api` | `crates/git-api` | 上面那套的 HTTP 外壳,`GET /patch`(库 + 独立 bin) |
+| `ferry` | `crates/ferry` | **部署用的合并二进制**:agent 与 git-patch 服务同进程 |
 
 协议独立成 crate,让两个独立部署的二进制在编译期锁死协议一致性。
+
+镜像里实际跑的是 `ferry`。两个子系统**按配置各自启用**:配了 `agent.upstreams` 就跑
+agent,配了 `server.root` 就跑 git-patch 服务,都没配则拒绝启动(退出码 1)。原有的
+纯 agent 部署换成它**无需改任何环境变量**。
 
 ## 运行
 
@@ -80,21 +87,21 @@ Redis 连接池参数(`pool_size`、`connection_timeout` 等)写在 URI 的查�
 redis://:pw@h1:6379,h2:6379/?pool_size=20&connection_timeout=3s
 ```
 
-或用容器跑(多阶段构建,只产出 agent;client 是库,由调用方自己集成):
+或用容器跑(多阶段构建,产出合并二进制 `ferry`;client 是库,由调用方自己集成):
 
 ```bash
-docker build -t ferry-agent .
+docker build -t ferry .
 
 # agent 要访问宿主机上的本地 HTTP 服务,所以用 host 网络最省事
 docker run --rm --network host \
   -e FERRY__REDIS__URI=redis://127.0.0.1:6379 \
   -e FERRY__AGENT__SERVICE=demo \
   -e FERRY__AGENT__UPSTREAMS=grok=http://127.0.0.1:8080 \
-  ferry-agent
+  ferry
 ```
 
-停止时用 `docker stop`(发 SIGTERM),agent 会停止拉取新请求并等 in-flight
-排空后再退出。**grace period 要留够** —— `docker stop` 默认只给 10 秒,
+停止时用 `docker stop`(发 SIGTERM),两个子系统一起排空 —— agent 停止拉取新请求、
+HTTP 服务停止收新连接,各自等在途请求做完再退出。**grace period 要留够** —— `docker stop` 默认只给 10 秒,
 k8s 用 `terminationGracePeriodSeconds`;时间不够会在排空途中被 SIGKILL。
 
 A 侧:
@@ -155,6 +162,136 @@ BridgeClient::start(
 cargo run -p bridge-client --example demo -- /api/foo        # 单次调用
 cargo run -p bridge-client --example concurrent -- 500 /     # 并发冒烟测试
 ```
+
+## Git patch 服务
+
+同一个 `ferry` 进程里还能跑一个 git patch 服务:给定仓库、分支和两个 commit,返回
+它们之间的完整 patch。仓库放在一个根目录下 —— 可以预先克隆,也可以配白名单让它按需
+自动克隆(见下文)。
+
+```bash
+FERRY__SERVER__ROOT=/srv/repos cargo run -p ferry
+```
+
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|---|---|---|---|
+| `server.root` | `FERRY__SERVER__ROOT` | *(空,不启用)* | 仓库根目录;`repo` 参数在此目录下解析 |
+| `server.addr` | `FERRY__SERVER__ADDR` | `127.0.0.1:7100` | 监听地址,**默认只绑回环** |
+| `server.remote` | `FERRY__SERVER__REMOTE` | `origin` | fetch 用的远端名 |
+| `server.repos` | `FERRY__SERVER__REPOS__<名字>` | *(空,不自动克隆)* | 允许自动克隆的白名单:仓库名 → clone URL |
+| `server.max_concurrency` | `FERRY__SERVER__MAX_CONCURRENCY` | `8` | 同时进行的 git 操作数(git 调用是阻塞的) |
+| `server.max_patch_bytes` | `FERRY__SERVER__MAX_PATCH_BYTES` | **`2097152`**(2 MiB) | 超限返回 413 而非截断 |
+
+```
+GET /patch?repo=<name>&branch=<branch>&prevCommit=<sha>&currentCommit=<sha>
+GET /health
+```
+
+```json
+{
+  "repo": "ferry", "branch": "main",
+  "prevCommit": "abc1234...", "currentCommit": "def5678...",
+  "fetched": true, "cloned": false,
+  "files": ["crates/agent/src/main.rs"],
+  "insertions": 19, "deletions": 2,
+  "patch": "diff --git a/crates/agent/src/main.rs ..."
+}
+```
+
+短 sha 可用,响应回显补全后的完整 sha。**只 fetch、不 checkout**:`git diff A B` 是纯
+对象库操作,不需要工作区 —— 于是并发请求同一仓库的不同分支不会互相踩,目录被人改脏
+或本地分叉也不影响。两个 commit 本地都有时连 fetch 都跳过(`fetched: false`),缺哪个
+才拉一次该分支。
+
+### 仓库从哪来
+
+两种方式,可以混用。
+
+**预先克隆**到根目录里。既然不需要工作区,`--mirror` 比普通克隆省:
+
+```bash
+cd /srv/repos
+git clone --mirror https://git.example.com/team/ferry.git ferry
+```
+
+**或者配白名单,首次请求时自动克隆**(同样是 bare,不检出工作区):
+
+```toml
+[server.repos]
+ferry = "https://git.example.com/team/ferry.git"
+# ssh 也支持,用 scp 式写法:git@git.example.com:team/ferry.git
+```
+
+```bash
+FERRY__SERVER__REPOS__FERRY=https://git.example.com/team/ferry.git
+```
+
+**只认白名单。** 请求里给的是**名字**,URL 完全由配置决定 —— 调用方碰不到地址,名字
+不在表里直接 404,服务绝不会拿请求里的东西去拼 URL 连外部地址。这与 `agent.upstreams`
+是同一条边界。留空(默认)则不自动克隆,仓库必须预先放好。克隆的认证与 fetch 共用一套。
+
+响应里的 `cloned` / `fetched` 标明这次请求是否真的动了网络:首次克隆后两者分别为
+`true` / `false`,之后命中本地对象则都是 `false`,只有缺 commit 时才 `fetched: true`。
+
+### 经 Redis 取 patch
+
+服务默认只绑回环,不直接对外。把它注册成 agent 的一个 upstream,调用方就用同一个
+`BridgeClient`、同一套队列约定拿到 patch —— 这正是 agent 的本职:把本地 HTTP 服务经
+Redis 暴露出去,不必为它另写一套 Redis 消费逻辑。
+
+```bash
+-e FERRY__SERVER__ROOT=/srv/repos
+-e FERRY__AGENT__UPSTREAMS__GITPATCH__BASE=http://127.0.0.1:7100
+```
+
+```rust
+let resp = client.call(CallRequest {
+    method: "GET".into(),
+    // host 是服务名 gitpatch,真实地址由 upstreams 配置决定
+    url: "http://gitpatch/patch?repo=ferry&branch=main\
+          &prevCommit=abc1234&currentCommit=def5678".into(),
+    headers: vec![],
+    body: Bytes::new(),
+    timeout: Duration::from_secs(30),
+}).await?;
+```
+
+**同进程是这里的关键。** 拆成两个容器时 `127.0.0.1` 不通,还得额外规划容器网络;同
+进程后 agent 直连回环即可,而 git patch 服务不必对外监听,入口唯一收敛到 Redis。
+
+**注意 `max_patch_bytes` 与协议上限的联动。** 响应要过 bridge 协议的 4 MiB
+`MAX_BODY_SIZE`,而 patch 装进 JSON 会因转义膨胀(换行 1 字节变 2,patch 里换行极
+密集,最坏接近翻倍)。默认取 2 MiB 正是为了转义后仍在 4 MiB 以内 —— 调大了会出现
+「服务自己放行、却在 agent 那关被 `TooLarge` 拒掉」这种定位困难的失败。只走本地
+HTTP、不过 Redis 时可以调大。
+
+### 安全边界
+
+`repo` 来自请求,直接拼进路径就是任意目录读取。两道拦截:先按语法拒绝(空段、`.`、
+`..`、反斜杠),再 `canonicalize` 后确认仍在根目录内 —— 后者才挡得住根目录里指向外部
+的符号链接,光看字符串是看不出来的。越界返回 400,仓库不存在返回 404。
+
+`prevCommit` / `currentCommit` 交给 libgit2 的 revparse,没有命令注入面:全程调库,
+不 fork shell。fetch 的认证走 ssh-agent / git credential helper,也就是用户 `git fetch`
+本来在用的那套;容器里通常没有 ssh-agent,建议 remote 用 https + credential helper,
+或把只读部署密钥挂进来。
+
+镜像为此装了 `libssl3` + `ca-certificates`(libgit2 是 C 库,不认 rustls,这是全项目
+唯一让 openssl 进来的地方);没装 `git`,fetch 由 libgit2 自己实现协议。
+
+### 命令行
+
+同一套能力也有 CLI,用于本机排查:
+
+```bash
+cargo run -p ferry-git -- -C /srv/repos/ferry diff HEAD~5 HEAD > changes.patch
+cargo run -p ferry-git -- -C /srv/repos/ferry checkout main
+cargo run -p ferry-git -- -C /srv/repos/ferry pull
+```
+
+`checkout` 用 libgit2 的 SAFE 策略、**绝不 force**,会被覆盖的未提交改动会让它失败并
+列出挡路的文件;`pull` **只做 fast-forward**,分叉时报错而不是自动 merge 或
+`reset --hard`。
 
 ## 几处关键取舍
 

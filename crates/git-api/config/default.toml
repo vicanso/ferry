@@ -1,0 +1,55 @@
+# ferry-git-api 的默认配置,通过 include_str! 烘焙进二进制。
+#
+# 三层叠加,后者覆盖前者(与 agent 完全一致):
+#   1. 本文件
+#   2. FERRY_CONFIG 指向的外部 TOML(可选)
+#   3. 环境变量,前缀 FERRY,层级分隔符是双下划线
+#      例如 FERRY__SERVER__ROOT、FERRY__SERVER__ADDR
+
+[server]
+# 监听地址。默认只绑回环 —— 本服务能读到 root 下所有仓库的全部代码,
+# 绝不该在没想清楚的情况下裸奔到 0.0.0.0。要对外提供时请显式改这里,
+# 并自行在前面放鉴权。
+addr = "127.0.0.1:7100"
+
+# git 仓库的根目录。请求里的 repo 参数在此目录下解析,且**不允许逃逸**:
+# 含 .. 的路径、绝对路径、以及解析符号链接后落到根目录之外的,一律拒绝。
+# 留空则拒绝启动 —— 没有根目录这个服务没有任何意义。
+# 环境变量: FERRY__SERVER__ROOT
+root = ""
+
+# 拉取用的远端名
+remote = "origin"
+
+# 同时进行的 git 操作数上限。git 操作是阻塞的(跑在 blocking 线程池里),
+# 不限流的话一波请求就能把线程池占满。
+max_concurrency = 8
+
+# 单个 patch 的字节上限(默认 2 MiB)。超了返回 413 而不是截断 ——
+# 截断过的 patch 既 apply 不了也没法信,不如明确失败。
+#
+# 为什么是 2 MiB 而不是更大:本服务通常经 bridge(Redis)对外提供,响应要过
+# bridge 协议的 MAX_BODY_SIZE = 4 MiB;而 patch 装进 JSON 会因转义而膨胀
+# (每个换行 1 字节变 2 字节,patch 里换行极密集,最坏接近翻倍)。取 2 MiB 才能
+# 保证转义后仍在 4 MiB 以内 —— 否则本服务放行了,却在 agent 那关被 TooLarge 拒掉,
+# 报错位置极具误导性。只走本地 HTTP、不过 Redis 时可以调大。
+max_patch_bytes = 2097152
+
+# 允许**自动 clone** 的仓库白名单:仓库名 → clone URL。
+#
+# 只有当请求里的 repo 在根目录下找不到时才会查这张表:查得到就克隆一份 bare 仓库
+# (不检出工作区,与「只 fetch 不 checkout」一致),查不到直接 404。
+#
+# URL 完全由配置决定,调用方只能点名字、碰不到地址 —— 这与 agent.upstreams 是同一条
+# 边界:绝不拿请求里的东西去拼 URL 连外部地址。留空(默认)表示不自动 clone,仓库必须
+# 预先克隆到根目录里。
+#
+# 认证与 fetch 共用一套(ssh-agent / git credential helper)。容器里通常没有
+# ssh-agent,建议用 https + credential helper,或挂只读部署密钥。
+#
+# 环境变量(层级分隔符是双下划线,名字会转成小写):
+#   FERRY__SERVER__REPOS__FERRY=https://git.example.com/team/ferry.git
+[server.repos]
+# ferry = "https://git.example.com/team/ferry.git"
+# ssh 也支持,用 scp 式写法(与上面二选一,同一个名字只能配一条):
+# ferry = "git@git.example.com:team/ferry.git"

@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/redis", "crates/client", "crates/agent"]
+members = [
+    "crates/protocol",
+    "crates/redis",
+    "crates/client",
+    "crates/agent",
+    "crates/git",
+    "crates/git-api",
+    "crates/ferry",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +17,10 @@ edition = "2021"
 [workspace.dependencies]
 bridge-protocol = { path = "crates/protocol" }
 bridge-redis = { path = "crates/redis" }
+ferry-git = { path = "crates/git" }
+# 供 ferry 合并二进制复用;两者也各自保留独立 bin,便于单跑与调试
+bridge-agent = { path = "crates/agent" }
+ferry-git-api = { path = "crates/git-api" }
 
 # tibba 已发布,直接用版本依赖。0.2.7 起 core 组件按依赖 DAG 重新分批
 # (error → util/config/crypto/runtime → cache/request),ferry 只用到其中三个:
@@ -49,3 +61,25 @@ snafu = "0.9.1"
 url = "2.5.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# libgit2 的 Rust 绑定,只给 ferry-git 用。
+#
+# https / ssh 这两个 feature 是「pull 能走网络」的前提,代价是拖进 openssl-sys 与
+# libssh2-sys —— libgit2 是 C 库,不认 rustls,这条绕不开(全项目唯一的例外,其余
+# 地方仍坚持 rustls)。关掉这两个 feature 依赖树会很干净,但 fetch 只剩本地路径,
+# 等于废掉 pull。
+#
+# 影响范围仅限本 crate:Dockerfile 只 `cargo build -p bridge-agent`,openssl 不会
+# 被编进 agent 镜像,也不需要在 runtime 层装 libssl —— 只是 Cargo.lock 里多几条记录。
+# 将来若要把 ferry-git 也打进镜像,builder 阶段需要 pkg-config + libssl-dev,
+# runtime 阶段需要 libssl3 与 ca-certificates。
+git2 = { version = "0.21.0", default-features = false, features = [
+    "https",
+    "ssh",
+] }
+tempfile = "3.24.0"
+
+# HTTP 服务端,只给 ferry-git-api 用。版本跟着 tibba-error 走 —— 它本来就依赖
+# axum 并为自己的 Error 实现了 IntoResponse,两边版本必须一致,否则 trait 不是
+# 同一个,错误类型根本返回不出去。
+axum = "0.8.9"

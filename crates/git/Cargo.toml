@@ -1,0 +1,11 @@
+[package]
+name = "ferry-git"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+git2.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
