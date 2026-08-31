@@ -368,6 +368,10 @@ pub async fn run(cfg: AgentConfig, shutdown: CancellationToken) -> Result<(), Ag
     // 这里不关心拓扑。connect 内部已做过 PING 的可达性验证。
     let redis = Arc::new(bridge_redis::connect(&cfg.redis_url).context(RedisSnafu)?);
 
+    // reqwest 用的是 rustls-no-provider,provider 得我们自己装,否则下面的 build()
+    // 直接 panic(这条路径 reqwest 是 panic! 而非返回 Err,map_err 兜不住)。
+    ensure_crypto_provider();
+
     // 必须禁用自动跟随重定向:否则上游只要回一个 302 指向内网地址,agent 就会
     // 跟过去,允许清单形同虚设。3xx 原样回给调用方,由它自己决定要不要跟。
     let http = reqwest::Client::builder()
@@ -670,13 +674,45 @@ fn map_reqwest_err(e: reqwest::Error) -> BridgeError {
         BridgeError::UpstreamTimeout
     } else if e.is_connect() {
         BridgeError::UpstreamUnreachable {
-            detail: e.to_string(),
+            detail: error_chain(&e),
         }
     } else {
         BridgeError::Internal {
-            detail: e.to_string(),
+            detail: error_chain(&e),
         }
     }
+}
+
+/// 把 `source` 链摊平成一行。
+///
+/// `reqwest::Error` 的 Display 只有最外层那句「error sending request for url (…)」,
+/// 真正的原因全在链里:DNS 查不到、连接被拒、证书校验不过、scheme 不被支持,
+/// 打出来一模一样,等于什么都没说。`BridgeError` 要跨 Redis 传回调用方,变体只能带
+/// 纯数据(见 forward 里的同款注释),所以在这里就折叠成字符串。
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
+}
+
+/// 幂等地给 rustls 装上 ring provider;已经装过任何 provider 就原样保留。
+///
+/// 这是本 crate 唯一一处「库里碰进程级全局状态」的例外 —— tracing subscriber 与信号
+/// 处理都留给 bin,因为那两样是应用的策略;provider 不是策略,而是构造 `reqwest::Client`
+/// 的前置条件,reqwest 的 "rustls" feature 本来也是不问自取地装 aws-lc-rs。放在库里
+/// 还避免了「两个 bin 都要记得装、漏一个就 panic」的雷。想换成 aws-lc-rs 的调用方
+/// 先装自己的即可,这里不会覆盖。
+fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    // Err 只可能是并发地被别人抢先装上了,那正是想要的结果,忽略
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// 构造转发用的 `HeaderMap`:先铺调用方 header(剔 hop-by-hop 与 `accept-encoding` ——

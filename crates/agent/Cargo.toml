@@ -10,6 +10,8 @@ serde.workspace = true
 tibba-config.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+# 只用来给 reqwest 装 ring provider,见 lib.rs 的 ensure_crypto_provider
+rustls.workspace = true
 snafu.workspace = true
 # main → macros/rt-multi-thread,ctrl_c → signal,Semaphore → sync,interval/sleep → time
 tokio = { workspace = true, features = [

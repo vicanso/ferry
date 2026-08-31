@@ -37,10 +37,15 @@ tibba-error = "0.2.7"
 # tokio 本身无 default feature,各 crate 按实际用到的 API 自行开启
 tokio = "1.52.3"
 tokio-util = "0.7.18"
-# 刻意不开 TLS:upstream 是本机明文 HTTP。若要支持 https,加 "rustls-tls"
-# (自带根证书)或 "rustls-tls-native-roots"(用系统信任库,镜像需装 ca-certificates)。
-# 注:rustls / ring 已作为可选依赖记在 Cargo.lock 里但未参与编译,所以将来启用
-# TLS 不会牵动其他依赖的版本。openssl / native-tls 则连锁文件里都没有。
+# rustls-no-provider:开 TLS,但不让 reqwest 替我们挑 crypto provider。
+# reqwest 0.13 起 feature 改了名,"rustls" 等价于 aws-lc-rs,会拖进 aws-lc-sys(C,
+# builder 得额外装 cmake + clang);"rustls-no-provider" 把选择权交出来,由 agent 在建
+# Client 之前装上 ring —— 纯 Rust(含少量汇编),Debian 镜像不必再加编译工具链。
+# 代价是**必须**装:没装时 reqwest 在 Client::builder().build() 里直接 panic 而不是
+# 返回 Err,map_err 兜不住 —— 见 crates/agent 的 ensure_crypto_provider。
+# 根证书走 rustls-platform-verifier(读系统信任库),runtime 镜像需要 ca-certificates,
+# 已因 libgit2 装了;内网自签 CA 得自行灌进系统信任库,光开 TLS 不够。
+# native-tls / openssl 仍然连 Cargo.lock 里都没有。
 #
 # gzip / brotli:让 reqwest 透明解压上游响应(agent 会剥掉调用方的 accept-encoding、
 # 由 reqwest 自行协商)。两者均为纯 Rust(flate2+miniz_oxide / brotli),不引 C 依赖,
@@ -49,6 +54,17 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "http2",
     "gzip",
     "brotli",
+    "rustls-no-provider",
+] }
+
+# 直接依赖 rustls 只为一件事:给上面的 reqwest 装 ring provider。
+# default-features = false 是关键 —— rustls 的默认 feature 里有 aws_lc_rs,
+# 且 prefer-post-quantum 也强制要它,不关就白绕了。tls12 保留:内网服务常常只到 1.2。
+rustls = { version = "0.23.42", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
 ] }
 serde_json = "1.0.150"
 # 与 Go encoding/json 对 []byte 的处理对齐:标准字母表 + 填充

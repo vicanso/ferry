@@ -66,19 +66,22 @@ RUN find crates -name '*.rs' -exec touch {} + \
 # 与 builder 用同一个 Debian 版本,保证 glibc 兼容
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 
-# libssl3:libgit2 动态链接的 openssl 运行时。
-# ca-certificates:git fetch 走 https 时校验服务端证书用;没有它握手会以
-#   「找不到任何根证书」失败。
-# 二者都是 git-patch 服务引入的。只跑 agent(不配 server.root)时用不上,
-# 但镜像是同一个,装着无妨(合计约 5 MB)。
+# libssl3:libgit2 动态链接的 openssl 运行时,由 git-patch 服务引入。只跑 agent
+#   (不配 server.root)时用不上,但镜像是同一个,装着无妨。
+# ca-certificates:两个子系统都要 —— git fetch 走 https 要校验服务端证书,agent
+#   转发 https 上游时 rustls-platform-verifier 读的也是这里的系统信任库。没有它,
+#   握手会以「找不到任何根证书」失败。
+#   上游或 git remote 若由内网自签 CA 签发(测试环境常见),光装这个包不够:得把那张
+#   CA 证书放进 /usr/local/share/ca-certificates/ 再跑一次 update-ca-certificates。
 #
 # 没装 git:fetch 由 libgit2 自己实现协议,不 fork git 进程。仓库要**预先克隆**
 # 到挂载进来的根目录里 —— 那一步在镜像外做。
 # ssh 远端另需凭证:libssh2 走 ssh-agent 或密钥文件,容器里通常没有 ssh-agent,
 # 建议 remote 用 https + credential helper,或把只读部署密钥挂进来。
 #
-# reqwest / redis 仍未启用 TLS feature。将来要用,统一选 rustls 而非 native-tls;
-# 走系统信任库时正好复用这里的 ca-certificates。
+# agent 的 reqwest 走 rustls + ring provider(见根 Cargo.toml),纯 Rust、不链系统
+# openssl,builder 也不需要 cmake/clang —— libssl 只服务于 libgit2 那条线。
+# redis 侧仍是明文;要 rediss:// 就在 tibba 侧开 rustls feature。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \

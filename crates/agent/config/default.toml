@@ -44,6 +44,10 @@ metrics_interval_secs = 30
 # 服务名 → 真实上游。调用方只写 https://{服务名}/path,真实 host(以及可选的注入
 # header)只在这里、不进 Redis;服务名不在表里就拒绝,**留空则拒绝启动**。
 #
+# base 的 scheme 可以是 http 或 https。走 https 时用的是编进二进制的 rustls(ring
+# provider),根证书读系统信任库 —— 容器里需要 ca-certificates(镜像已装),内网自签
+# CA 的上游还要把 CA 灌进信任库,否则握手报「找不到根证书」。
+#
 # 两种写法:
 #   1) 裸字符串 —— 只有 base、不注入 header:
 #        grok = "http://10.51.0.5:7257"

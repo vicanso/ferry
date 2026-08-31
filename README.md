@@ -80,6 +80,10 @@ base = "http://10.51.0.5:7257"
 authorization = "Bearer sk-..."   # 调用方不必再发,Redis 里也看不到
 ```
 
+上游 base 可以是 `https://`:agent 的 HTTP 客户端编进了 rustls(ring provider,纯 Rust,
+不链 openssl),根证书读系统信任库。所以容器里必须有 `ca-certificates`(镜像已装),内网
+自签 CA 签发的上游还得把那张 CA 灌进系统信任库,否则握手会以找不到根证书失败。
+
 Redis 连接池参数(`pool_size`、`connection_timeout` 等)写在 URI 的查询串里,
 由 tibba-cache 解析:
 
@@ -276,8 +280,9 @@ HTTP、不过 Redis 时可以调大。
 本来在用的那套;容器里通常没有 ssh-agent,建议 remote 用 https + credential helper,
 或把只读部署密钥挂进来。
 
-镜像为此装了 `libssl3` + `ca-certificates`(libgit2 是 C 库,不认 rustls,这是全项目
-唯一让 openssl 进来的地方);没装 `git`,fetch 由 libgit2 自己实现协议。
+镜像为此装了 `libssl3`(libgit2 是 C 库,不认 rustls,这是全项目唯一让 openssl 进来的
+地方)和 `ca-certificates`(agent 转发 https 上游时读的也是它);没装 `git`,fetch 由
+libgit2 自己实现协议。
 
 ### 命令行
 
